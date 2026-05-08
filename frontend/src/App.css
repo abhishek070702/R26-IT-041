@@ -1,0 +1,274 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, Helvetica, sans-serif;
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  color: #f8fafc;
+}
+
+.page {
+  min-height: 100vh;
+  padding: 40px 20px;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.header {
+  text-align: center;
+  margin-bottom: 32px;
+}
+
+.header h1 {
+  font-size: 42px;
+  margin: 0;
+  color: #ffffff;
+}
+
+.header p {
+  margin-top: 10px;
+  font-size: 18px;
+  color: #cbd5e1;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+
+.card {
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 20px;
+  padding: 24px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+}
+
+.card h2 {
+  margin-top: 0;
+  font-size: 26px;
+  text-align: center;
+}
+
+.small-text,
+.empty-text {
+  color: #cbd5e1;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.file-label,
+.camera-btn,
+.capture-btn,
+.predict-btn {
+  border: none;
+  border-radius: 14px;
+  color: white;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.file-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 18px;
+  background: #334155;
+  border: 1px dashed #38bdf8;
+}
+
+.hidden-input {
+  display: none;
+}
+
+.camera-btn {
+  padding: 14px 18px;
+  background: linear-gradient(135deg, #7c3aed, #2563eb);
+}
+
+.capture-btn {
+  width: 100%;
+  padding: 14px 18px;
+  margin-top: 14px;
+  background: linear-gradient(135deg, #16a34a, #22c55e);
+}
+
+.predict-btn {
+  width: 100%;
+  margin-top: 20px;
+  padding: 15px 18px;
+  background: linear-gradient(135deg, #2563eb, #06b6d4);
+}
+
+.file-label:hover,
+.camera-btn:hover,
+.capture-btn:hover,
+.predict-btn:hover {
+  transform: translateY(-2px);
+}
+
+.predict-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.error-text {
+  color: #fca5a5;
+  text-align: center;
+  margin-top: 14px;
+}
+
+.camera-box,
+.preview-box {
+  margin-top: 18px;
+  background: #020617;
+  border-radius: 16px;
+  padding: 12px;
+  text-align: center;
+}
+
+.camera-preview {
+  width: 100%;
+  max-height: 420px;
+  border-radius: 12px;
+  object-fit: contain;
+  background: #000;
+}
+
+.preview-box img {
+  max-width: 100%;
+  max-height: 420px;
+  border-radius: 12px;
+  object-fit: contain;
+}
+
+.result-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.result-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border-radius: 12px;
+  background: #020617;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.result-row span {
+  color: #cbd5e1;
+}
+
+.result-row strong {
+  color: #38bdf8;
+  text-align: right;
+}
+
+.message-box {
+  padding: 18px;
+  border-radius: 16px;
+  background: rgba(37, 99, 235, 0.18);
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  text-align: center;
+}
+
+.message-box h3,
+.predictions h3 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  text-align: center;
+}
+
+.message-box p {
+  font-size: 18px;
+  line-height: 1.6;
+  color: #ffffff;
+}
+
+.predictions {
+  margin-top: 10px;
+}
+
+.prediction-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-radius: 10px;
+  background: #020617;
+  color: #e2e8f0;
+}
+
+@media (max-width: 850px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .header h1 {
+    font-size: 30px;
+  }
+
+  .action-row {
+    grid-template-columns: 1fr;
+  }
+}
+.describe-btn {
+  width: 100%;
+  margin-top: 14px;
+  padding: 15px 18px;
+  background: linear-gradient(135deg, #16a34a, #22c55e);
+  border: none;
+  border-radius: 14px;
+  color: white;
+  font-size: 17px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.describe-btn:hover {
+  transform: translateY(-2px);
+}
+
+.describe-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.section-title {
+  text-align: center;
+  color: #38bdf8;
+  margin-top: 6px;
+  margin-bottom: 14px;
+}
+
+.image-description-output {
+  margin-top: 20px;
+  border-top: 1px solid rgba(148, 163, 184, 0.25);
+  padding-top: 20px;
+}
+
+.description-box {
+  background: rgba(22, 163, 74, 0.16);
+  border: 1px solid rgba(34, 197, 94, 0.45);
+}

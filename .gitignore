@@ -37,6 +37,7 @@ __pycache__/
 # =========================
 backend/uploads/
 uploads/
+backend/content_summarization_category_detection/region_cache/
 temp/
 tmp/
 

@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { ContentSummarizationSection } from "./ContentSummarizationSection";
+import { API_BASE_URL } from "./config";
 import "./App.css";
 
+type AppTab = "document" | "summarization";
+
 function App() {
+  const [activeTab, setActiveTab] = useState<AppTab>("document");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
@@ -18,11 +23,9 @@ function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const DOCUMENT_API_URL =
-    "http://172.27.206.233:8000/document/predict-document-type";
+  const DOCUMENT_API_URL = `${API_BASE_URL}/document/predict-document-type`;
 
-  const IMAGE_DESCRIPTION_API_URL =
-    "http://172.27.206.233:8000/image/describe-image";
+  const IMAGE_DESCRIPTION_API_URL = `${API_BASE_URL}/image/describe-image`;
 
   useEffect(() => {
     if (!cameraActive) return;
@@ -299,9 +302,31 @@ function App() {
       <div className="container">
         <header className="header">
           <h1>Smart Wearable Reading Assistant</h1>
-          <p>Document Identification + Inside Page Image Description Demo</p>
+          <p>Document identification, image description, and content summarization</p>
         </header>
 
+        <nav className="app-tabs" aria-label="Main modules">
+          <button
+            type="button"
+            className={activeTab === "document" ? "app-tab active" : "app-tab"}
+            onClick={() => setActiveTab("document")}
+          >
+            Document &amp; image
+          </button>
+          <button
+            type="button"
+            className={activeTab === "summarization" ? "app-tab active" : "app-tab"}
+            onClick={() => setActiveTab("summarization")}
+          >
+            Summarization &amp; categories
+          </button>
+        </nav>
+
+        {activeTab === "summarization" ? (
+          <ContentSummarizationSection />
+        ) : null}
+
+        {activeTab === "document" ? (
         <div className="grid">
           <section className="card upload-card">
             <h2>Upload or Capture Page</h2>
@@ -449,6 +474,7 @@ function App() {
             )}
           </section>
         </div>
+        ) : null}
       </div>
     </div>
   );

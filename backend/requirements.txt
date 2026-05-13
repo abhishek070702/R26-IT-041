@@ -1,6 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
+python-dotenv
+openai
+requests
 torch
 torchvision
 pillow
@@ -8,4 +11,7 @@ numpy
 opencv-python
 easyocr
 matplotlib
-scikit-learn
+scikit-learn>=1.5.0,<1.7.0
+joblib
+pandas
+pytesseract

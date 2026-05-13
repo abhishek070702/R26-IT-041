@@ -3,12 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.document_identification.routes import router as document_router
 from backend.image_description.routes import router as image_router
+from backend.content_summarization_category_detection.routes import (
+    router as content_summarization_router,
+)
 
 
 app = FastAPI(
     title="Smart Wearable Reading Assistant API",
-    description="Backend API for Document Identification and Image Description modules.",
-    version="1.0.0"
+    description=(
+        "Backend API for Document Identification, Image Description, "
+        "and Content Summarization & Category Detection."
+    ),
+    version="1.0.0",
 )
 
 
@@ -17,7 +23,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://172.27.206.233:5173"
+        "http://172.27.206.233:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -27,6 +33,7 @@ app.add_middleware(
 
 app.include_router(document_router)
 app.include_router(image_router)
+app.include_router(content_summarization_router)
 
 
 @app.get("/")
@@ -35,8 +42,9 @@ def home():
         "message": "Smart Wearable Reading Assistant Backend is running",
         "modules": [
             "Document Identification",
-            "Image Description"
-        ]
+            "Image Description",
+            "Content Summarization & Category Detection",
+        ],
     }
 
 

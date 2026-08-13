@@ -1,74 +1,43 @@
 # =========================
-# Secret / environment files
-# =========================
-.env
-*.env
-backend/.env
-frontend/.env
-.env.local
-.env.development
-.env.production
-
-# =========================
-# Python virtual environments
-# =========================
-venv/
-venv_easyocr/
-.env/
-.venv/
-
-# =========================
-# Python cache
+# Python
 # =========================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
 *.py[cod]
-*$py.class
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+venv_easyocr/
+env/
 
 # =========================
-# Jupyter Notebook checkpoints
+# Environment / Secrets
+# =========================
+.env
+.env.local
+.env.production
+
+# Keep example environment files
+!.env.example
+
+# =========================
+# Jupyter
 # =========================
 .ipynb_checkpoints/
 
 # =========================
-# Backend uploads / temporary files
+# Node / React
 # =========================
-backend/uploads/
-uploads/
-backend/content_summarization_category_detection/region_cache/
-temp/
-tmp/
-
-# =========================
-# Dataset folders
-# =========================
-dataset_raw/
-dataset_split/
-dataset_removed_confusing_images/
-
-# =========================
-# Frontend dependencies and build files
-# =========================
-frontend/node_modules/
-frontend/dist/
-frontend/dist-ssr/
-frontend/.vite/
-
 node_modules/
 dist/
-dist-ssr/
+build/
 
 # =========================
-# Logs
+# Cursor / VS Code
 # =========================
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
+.cursor/
+.vscode/
 
 # =========================
 # OS files
@@ -77,12 +46,8 @@ pnpm-debug.log*
 Thumbs.db
 
 # =========================
-# IDE / editor files
+# Logs / temporary files
 # =========================
-.vscode/
-.idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+*.log
+*.tmp
+*.temp

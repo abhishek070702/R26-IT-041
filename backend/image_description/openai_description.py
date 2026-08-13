@@ -1,3 +1,13 @@
+"""
+LEGACY / DEV ONLY — OpenAI cloud image description.
+
+This file is not used in the main research pipeline.
+Main PP2 pipeline uses local_blip_description.py.
+
+Kept for the old /image/describe-image route only.
+Do not import this module from backend/abhishek_module/.
+"""
+
 import os
 import base64
 from io import BytesIO

@@ -3,16 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.document_identification.routes import router as document_router
 from backend.image_description.routes import router as image_router
-from backend.content_summarization_category_detection.routes import (
-    router as content_summarization_router,
-)
+
+from backend.abhishek_module.routes import router as abhishek_router
 
 
 app = FastAPI(
     title="Smart Wearable Reading Assistant API",
     description=(
         "Backend API for Document Identification, Image Description, "
-        "and Content Summarization & Category Detection."
+        "and Content Summarization & Category Detection. "
+        "Main Abhishek PP2 research path: POST /abhishek/analyze "
+        "and reusable POST /abhishek/describe-image "
+        "(local Florence/BLIP image description)."
     ),
     version="1.0.0",
 )
@@ -33,7 +35,7 @@ app.add_middleware(
 
 app.include_router(document_router)
 app.include_router(image_router)
-app.include_router(content_summarization_router)
+app.include_router(abhishek_router)
 
 
 @app.get("/")
@@ -42,8 +44,9 @@ def home():
         "message": "Smart Wearable Reading Assistant Backend is running",
         "modules": [
             "Document Identification",
-            "Image Description",
+            "Image Description (legacy OpenAI /image routes)",
             "Content Summarization & Category Detection",
+            "Abhishek Module (PP2: /abhishek/analyze, /abhishek/describe-image)",
         ],
     }
 

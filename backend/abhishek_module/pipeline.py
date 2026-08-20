@@ -159,6 +159,19 @@ WEAK_CAPTION_PHRASES = (
     "a picture",
 )
 
+WEAK_IMAGE_DESCRIPTION_PHRASES = (
+    "related to the story",
+    "visual design",
+    "related to the document",
+    "not clear",
+    "main cover image",
+    "illustrated scene related to the story",
+    "visual content detected, but description is not clear",
+    "cover contains an illustration or visual design",
+    "no clear main image is detected",
+    "no important visual image is detected",
+)
+
 
 def _empty_result() -> dict:
     return {
@@ -1057,10 +1070,14 @@ def _openai_fallback_flag() -> bool:
         return False
 
 
-def _is_generic_image_description(text: str) -> bool:
+def _is_weak_image_description(text: str) -> bool:
+    """
+    True when a local image description is empty or too generic to use as-is.
+    """
     normalized = _normalize_compare_text(text)
     if not normalized:
         return True
+
     if normalized.startswith(
         "the cover contains an illustration or visual design related to"
     ):
@@ -1069,7 +1086,28 @@ def _is_generic_image_description(text: str) -> bool:
         return True
     if normalized == _normalize_compare_text(COVER_ILLUSTRATION_FALLBACK):
         return True
+
+    for phrase in WEAK_IMAGE_DESCRIPTION_PHRASES:
+        if phrase in normalized:
+            return True
+
     return False
+
+
+def _local_image_descriptions_are_weak(image_descriptions: list[str]) -> bool:
+    if not image_descriptions:
+        return True
+    return any(_is_weak_image_description(item) for item in image_descriptions)
+
+
+def _format_local_image_description_log(image_descriptions: list[str]) -> str:
+    if not image_descriptions:
+        return ""
+    return " | ".join(str(item).strip() for item in image_descriptions if str(item).strip())
+
+
+def _is_generic_image_description(text: str) -> bool:
+    return _is_weak_image_description(text)
 
 
 def _should_trigger_openai_fallback(
@@ -1078,12 +1116,10 @@ def _should_trigger_openai_fallback(
     status: str,
 ) -> tuple[bool, str]:
     reasons: list[str] = []
+    if _local_image_descriptions_are_weak(image_descriptions):
+        reasons.append("weak_image_description")
     if title == TITLE_NOT_CLEAR:
         reasons.append("title_unclear")
-    if not image_descriptions:
-        reasons.append("empty_image_descriptions")
-    elif any(_is_generic_image_description(item) for item in image_descriptions):
-        reasons.append("generic_image_description")
     if status == "partial_success":
         reasons.append("partial_success")
     if not reasons:
@@ -1103,11 +1139,25 @@ def _apply_openai_fallback(
     USE_OPENAI_FALLBACK=true and a trigger condition matches.
     Never raises.
     """
+    local_desc_log = _format_local_image_description_log(image_descriptions)
+    local_is_weak = _local_image_descriptions_are_weak(image_descriptions)
+    print(f"[pipeline] local image description={local_desc_log!r}")
+    print(f"[pipeline] is weak image description={str(local_is_weak).lower()}")
+    logger.info(
+        "local image description=%r is_weak=%s",
+        local_desc_log,
+        local_is_weak,
+    )
+
     enabled = _openai_fallback_flag()
     print(f"[pipeline] USE_OPENAI_FALLBACK={str(enabled).lower()}")
     logger.info("USE_OPENAI_FALLBACK=%s", enabled)
 
+    openai_used_for_description = False
+
     if not enabled:
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
         print("[pipeline] OpenAI fallback skipped")
         logger.info("OpenAI fallback skipped reason=disabled")
         return title, image_descriptions, warnings
@@ -1116,6 +1166,8 @@ def _apply_openai_fallback(
         title, image_descriptions, status
     )
     if not should_run:
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
         print(f"[pipeline] OpenAI fallback skipped ({reason})")
         logger.info("OpenAI fallback skipped reason=%s", reason)
         return title, image_descriptions, warnings
@@ -1124,6 +1176,8 @@ def _apply_openai_fallback(
     logger.info("OpenAI fallback triggered reason=%s", reason)
 
     if _run_openai_vision_fallback is None:
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
         print("[pipeline] OpenAI fallback failed")
         logger.warning("OpenAI fallback failed reason=module_missing")
         return title, image_descriptions, warnings
@@ -1132,10 +1186,14 @@ def _apply_openai_fallback(
         fallback = _run_openai_vision_fallback(image_path)
     except Exception:
         logger.exception("OpenAI fallback crashed; keeping local result")
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
         print("[pipeline] OpenAI fallback failed")
         return title, image_descriptions, warnings
 
     if not fallback or not isinstance(fallback, dict):
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
         print("[pipeline] OpenAI fallback failed")
         logger.warning("OpenAI fallback failed reason=empty_or_invalid")
         return title, image_descriptions, warnings
@@ -1153,18 +1211,20 @@ def _apply_openai_fallback(
         merged = True
         print(f"[pipeline] OpenAI fallback title merged: {new_title!r}")
 
-    local_desc_unusable = (
-        not new_descriptions
-        or any(_is_generic_image_description(item) for item in new_descriptions)
-    )
+    local_desc_unusable = _local_image_descriptions_are_weak(new_descriptions)
     if local_desc_unusable and openai_description:
         new_descriptions = [openai_description]
         new_warnings = [w for w in new_warnings if w != "Image description failed"]
         merged = True
+        openai_used_for_description = True
         print(
             "[pipeline] OpenAI fallback image description merged: "
             f"{openai_description!r}"
         )
+
+    final_desc_log = _format_local_image_description_log(new_descriptions)
+    print(f"[pipeline] OpenAI fallback used={str(openai_used_for_description).lower()}")
+    print(f"[pipeline] final image description={final_desc_log!r}")
 
     if not merged:
         print("[pipeline] OpenAI fallback failed")
@@ -1174,7 +1234,11 @@ def _apply_openai_fallback(
     if OPENAI_FALLBACK_WARNING not in new_warnings:
         new_warnings.append(OPENAI_FALLBACK_WARNING)
     print("[pipeline] OpenAI fallback used")
-    logger.info("OpenAI fallback used title=%r descriptions=%r", new_title, new_descriptions)
+    logger.info(
+        "OpenAI fallback used title=%r descriptions=%r",
+        new_title,
+        new_descriptions,
+    )
     return new_title, new_descriptions, new_warnings
 
 

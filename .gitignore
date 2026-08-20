@@ -51,3 +51,8 @@ Thumbs.db
 *.log
 *.tmp
 *.temp
+backend/outputs/
+backend/uploads/
+integration/manoj_camera_module/integration_outputs/
+integration/manoj_camera_module/captured_pages/
+integration/manoj_camera_module/latest_captured_image.txt

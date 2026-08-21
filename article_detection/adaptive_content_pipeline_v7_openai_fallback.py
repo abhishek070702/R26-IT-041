@@ -475,6 +475,8 @@ def prepare_page_image(
     config: PipelineConfig,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     resized, scale = resize_for_ocr(image, config.target_width)
+    # Drop surrounding fabric / table before deskew when a page is visible.
+    resized = crop_to_page_surface(resized)
     deskewed = deskew_image(resized)
     gray = cv2.cvtColor(deskewed, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, None, 7, 7, 21)
@@ -487,6 +489,365 @@ def prepare_page_image(
     )
     return deskewed, sharpened, scale
 
+
+def crop_to_page_surface(image: np.ndarray) -> np.ndarray:
+    """
+    Crop the largest bright rectangular page out of a camera photo.
+    Removes patterned fabric / table around storybooks and newspapers.
+    """
+    if image is None or image.size == 0:
+        return image
+
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, binary = cv2.threshold(
+        blur,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+
+    # Prefer the bright page side of Otsu.
+    if float(np.mean(gray[binary > 0])) < float(np.mean(gray[binary == 0])):
+        binary = cv2.bitwise_not(binary)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        closed,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return image
+
+    page_area = height * width
+    best = None
+    best_score = -1.0
+
+    for contour in contours:
+        x, y, box_w, box_h = cv2.boundingRect(contour)
+        area = box_w * box_h
+        if area < 0.22 * page_area:
+            continue
+        if box_w < 0.35 * width or box_h < 0.35 * height:
+            continue
+
+        roi = gray[y : y + box_h, x : x + box_w]
+        brightness = float(np.mean(roi))
+        if brightness < 120:
+            continue
+
+        fill = float(cv2.contourArea(contour)) / max(1.0, float(area))
+        score = area * (0.55 + 0.45 * min(1.0, brightness / 220.0)) * (0.7 + 0.3 * fill)
+        if score > best_score:
+            best_score = score
+            best = (x, y, box_w, box_h)
+
+    if best is None:
+        return image
+
+    x, y, box_w, box_h = best
+    # If the crop barely shrinks the image, keep the original.
+    if box_w * box_h > 0.92 * page_area:
+        return image
+
+    pad = max(4, int(0.012 * min(height, width)))
+    x1 = max(0, x + pad)
+    y1 = max(0, y + pad)
+    x2 = min(width, x + box_w - pad)
+    y2 = min(height, y + box_h - pad)
+    if x2 - x1 < 80 or y2 - y1 < 80:
+        return image
+    return image[y1:y2, x1:x2].copy()
+
+
+COMMON_SHORT_WORDS = {
+    "a", "i", "o", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in",
+    "is", "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us",
+    "we", "am", "ox", "the", "and", "but", "for", "had", "has", "are", "was",
+    "his", "her", "him", "you", "not", "out", "get", "all", "any", "can",
+    "did", "its", "let", "may", "new", "now", "old", "our", "own", "say",
+    "she", "too", "who", "boy", "man", "men", "one", "two", "way", "yes",
+}
+
+
+def looks_like_prose_token(token: str) -> bool:
+    cleaned = re.sub(r"^[^A-Za-z']+|[^A-Za-z']+$", "", token)
+    if not cleaned:
+        return False
+    low = cleaned.lower()
+    if len(cleaned) <= 2:
+        return low in COMMON_SHORT_WORDS
+    if len(cleaned) == 3:
+        if cleaned.isupper():
+            return False
+        if low in COMMON_SHORT_WORDS:
+            return True
+        return bool(re.search(r"[aeiouy]", low)) and cleaned.isalpha()
+    if cleaned.isupper():
+        return False
+    if not re.search(r"[aeiouy]", low):
+        return False
+    if re.search(r"(.)\1{3,}", cleaned):
+        return False
+    if not re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", cleaned):
+        return False
+    vowels = len(re.findall(r"[aeiouy]", low))
+    if vowels / max(1, len(low)) < 0.18:
+        return False
+    return True
+
+
+def prose_noise_ratio(text: str) -> float:
+    tokens = re.findall(r"[A-Za-z0-9']+|[^A-Za-z0-9'\s]", text)
+    if not tokens:
+        return 1.0
+    bad = 0
+    for token in tokens:
+        if re.fullmatch(r"[^A-Za-z0-9'\s]+", token):
+            if token in {".", ",", "!", "?", ";", ":", "'", '"', "-", "—", "–", "(", ")"}:
+                continue
+            bad += 1
+            continue
+        if not looks_like_prose_token(token):
+            bad += 1
+    return bad / max(1, len(tokens))
+
+
+def _keep_prose_token_run(tokens: Sequence[str]) -> list[str]:
+    """Keep the longest contiguous readable word run; drop edge junk."""
+    if not tokens:
+        return []
+
+    flags = []
+    for token in tokens:
+        core = re.sub(r"^[^A-Za-z']+|[^A-Za-z']+$", "", token)
+        if re.fullmatch(r"[,.:;!?\"'()/-]+", token):
+            flags.append(True)
+        else:
+            flags.append(looks_like_prose_token(core))
+
+    best_start = 0
+    best_end = 0
+    index = 0
+    while index < len(flags):
+        if not flags[index]:
+            index += 1
+            continue
+        end = index
+        while end < len(flags) and flags[end]:
+            end += 1
+        if end - index > best_end - best_start:
+            best_start, best_end = index, end
+        index = end
+
+    kept = list(tokens[best_start:best_end])
+    # Trim leftover punctuation-only ends.
+    while kept and re.fullmatch(r"[,.:;!?\"'()/-]+", kept[0]):
+        kept.pop(0)
+    while kept and re.fullmatch(r"[,.:;!?\"'()/-]+", kept[-1]):
+        kept.pop()
+    return kept
+
+
+def filter_prose_text(text: str) -> str:
+    """
+    Keep readable story/book sentences; drop fabric/illustration OCR junk.
+    """
+    if not text or not str(text).strip():
+        return ""
+
+    paragraphs: list[str] = []
+    for block in re.split(r"\n\s*\n", str(text)):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        kept_lines: list[str] = []
+        for line in lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            kept = _keep_prose_token_run(tokens)
+            if len(kept) < 4 and not (
+                len(kept) >= 3 and any(len(re.sub(r"[^A-Za-z]", "", token)) >= 5 for token in kept)
+            ):
+                continue
+            candidate = " ".join(kept)
+            if prose_noise_ratio(candidate) > 0.30:
+                continue
+            kept_lines.append(candidate)
+        if not kept_lines:
+            # One wrapped blob: recover the best prose span from all tokens.
+            kept = _keep_prose_token_run(block.split())
+            if len(kept) >= 8:
+                candidate = " ".join(kept)
+                if prose_noise_ratio(candidate) <= 0.30:
+                    paragraphs.append(candidate)
+            continue
+        paragraph = " ".join(kept_lines)
+        paragraph = re.sub(r"\s+", " ", paragraph).strip()
+        if len(paragraph.split()) < 4:
+            continue
+        if prose_noise_ratio(paragraph) > 0.30:
+            continue
+        paragraphs.append(paragraph)
+
+    return "\n\n".join(paragraphs).strip()
+
+
+def ocr_confident_prose_text(
+    prepared_gray: np.ndarray,
+    *,
+    min_confidence: float = 48.0,
+) -> str:
+    """
+    Word-level OCR that keeps only confident prose tokens.
+    Ignores low-confidence illustration / fabric false text.
+    """
+    data = pytesseract.image_to_data(
+        prepared_gray,
+        config="--oem 3 --psm 3 -c preserve_interword_spaces=1",
+        output_type=Output.DATAFRAME,
+    )
+    if data is None or data.empty:
+        return ""
+
+    data = data.dropna(subset=["text"]).copy()
+    data["text"] = data["text"].astype(str).str.strip()
+    data["conf"] = pd.to_numeric(data["conf"], errors="coerce").fillna(-1)
+    data = data[
+        (data["text"] != "")
+        & (data["conf"] >= min_confidence)
+    ]
+    if data.empty:
+        return ""
+
+    words: list[dict[str, Any]] = []
+    for _, row in data.iterrows():
+        token = str(row["text"]).strip()
+        if not looks_like_prose_token(token) and not re.fullmatch(
+            r"[A-Za-z]+(?:'[A-Za-z]+)?[,.:;!?\"']?",
+            token,
+        ):
+            continue
+        if not looks_like_prose_token(re.sub(r"[^A-Za-z']", "", token)):
+            continue
+        words.append(
+            {
+                "text": token,
+                "left": int(row["left"]),
+                "top": int(row["top"]),
+                "height": max(1, int(row["height"])),
+                "conf": float(row["conf"]),
+            }
+        )
+
+    if not words:
+        return ""
+
+    words.sort(key=lambda item: (item["top"], item["left"]))
+    median_height = float(np.median([item["height"] for item in words]))
+    line_tol = max(10.0, 0.65 * median_height)
+
+    lines: list[list[dict[str, Any]]] = []
+    for word in words:
+        placed = False
+        for line in lines:
+            line_top = float(np.mean([item["top"] for item in line]))
+            if abs(word["top"] - line_top) <= line_tol:
+                line.append(word)
+                placed = True
+                break
+        if not placed:
+            lines.append([word])
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    previous_bottom = None
+
+    for line in lines:
+        line.sort(key=lambda item: item["left"])
+        text = " ".join(item["text"] for item in line).strip()
+        if not text or prose_noise_ratio(text) > 0.45:
+            continue
+        top = min(item["top"] for item in line)
+        bottom = max(item["top"] + item["height"] for item in line)
+        if previous_bottom is not None and (top - previous_bottom) > 1.35 * median_height:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+        current.append(text)
+        previous_bottom = bottom
+
+    if current:
+        paragraphs.append(" ".join(current))
+
+    return filter_prose_text("\n\n".join(paragraphs))
+
+
+def best_full_page_ocr(prepared_gray: np.ndarray, document_type: str) -> str:
+    best_text = ""
+    best_score = -1.0
+    newspaper_mode = normalize_document_type(document_type) in MULTI_CATEGORY_TYPES
+
+    # High-confidence word pass first for books / letters / reports.
+    if not newspaper_mode:
+        prose = ocr_confident_prose_text(prepared_gray)
+        if prose:
+            best_text = prose
+            best_score = (
+                len(prose.split())
+                + 120.0 * ocr_quality_score(prose)
+                - 90.0 * prose_noise_ratio(prose)
+            )
+
+    for psm in (3, 4, 6, 11):
+        raw = pytesseract.image_to_string(
+            prepared_gray,
+            config=f"--oem 3 --psm {psm}",
+        )
+        cleaned = clean_ocr_lines(raw.splitlines(), document_type)
+        cleaned = join_hyphenated_lines(cleaned)
+
+        if newspaper_mode:
+            text = "\n".join(cleaned).strip()
+        else:
+            paragraphs: list[str] = []
+            current: list[str] = []
+            for line in cleaned:
+                if not line.strip():
+                    if current:
+                        paragraphs.append(" ".join(current))
+                        current = []
+                    continue
+                current.append(line.strip())
+            if current:
+                paragraphs.append(" ".join(current))
+            text = filter_prose_text("\n\n".join(paragraphs))
+
+        if not text:
+            continue
+
+        score = (
+            len(text.split())
+            + 80.0 * ocr_quality_score(text)
+            - (0.0 if newspaper_mode else 100.0 * prose_noise_ratio(text))
+        )
+        if score > best_score:
+            best_score = score
+            best_text = text
+
+    if not newspaper_mode:
+        best_text = filter_prose_text(best_text)
+
+    return best_text
+
+
+# ============================================================
+# 5. GEOMETRY HELPERS
+# ============================================================
 
 
 def extract_ocr_lines(
@@ -514,11 +875,26 @@ def extract_ocr_lines(
 
     lines: list[OCRLine] = []
     grouping = ["block_num", "par_num", "line_num"]
+    newspaper_mode = normalize_document_type(document_type) in MULTI_CATEGORY_TYPES
 
     for (block_num, par_num, line_num), group in data.groupby(grouping, sort=False):
         group = group.sort_values("left")
-        text = clean_text_basic(" ".join(group["text"].tolist()))
+        raw_tokens = [str(token).strip() for token in group["text"].tolist() if str(token).strip()]
+        if not newspaper_mode:
+            raw_tokens = [
+                token
+                for token in raw_tokens
+                if looks_like_prose_token(re.sub(r"[^A-Za-z']", "", token))
+                or re.fullmatch(r"[,.:;!?\"'()/-]+", token)
+            ]
+            if not raw_tokens:
+                continue
+            text = " ".join(raw_tokens)
+        else:
+            text = clean_text_basic(" ".join(raw_tokens))
         if not text:
+            continue
+        if not newspaper_mode and prose_noise_ratio(text) > 0.5:
             continue
 
         x1 = int(group["left"].min())
@@ -546,32 +922,6 @@ def extract_ocr_lines(
         )
 
     return sorted(lines, key=lambda line: (line.y1, line.x1))
-
-
-
-def best_full_page_ocr(prepared_gray: np.ndarray, document_type: str) -> str:
-    best_text = ""
-    best_score = -1.0
-
-    for psm in (3, 4, 6, 11):
-        raw = pytesseract.image_to_string(
-            prepared_gray,
-            config=f"--oem 3 --psm {psm}",
-        )
-        cleaned = clean_ocr_lines(raw.splitlines(), document_type)
-        cleaned = join_hyphenated_lines(cleaned)
-        text = "\n".join(cleaned).strip()
-        score = len(text.split()) + 80.0 * ocr_quality_score(text)
-        if score > best_score:
-            best_score = score
-            best_text = text
-
-    return best_text
-
-
-# ============================================================
-# 5. GEOMETRY HELPERS
-# ============================================================
 
 
 def bbox_from_lines(lines: Sequence[OCRLine]) -> tuple[int, int, int, int]:
@@ -1905,33 +2255,42 @@ def reconstruct_selected_text_with_llama(
     document_type: str,
     config: PipelineConfig,
 ) -> str:
-    cleaned = clean_text_basic(text)
-    if len(cleaned.split()) < 30:
+    cleaned = prepare_readable_text(text, document_type)
+    if len(cleaned.split()) < 12:
         return cleaned
 
     prompt = f"""
-You clean OCR article text for a blind reader.
+You clean OCR reading text for a blind wearable assistant.
 Document type: {document_type}
-Article title: {title}
+Title: {title or "(none)"}
 
 Rules:
-- Fix only obvious OCR spacing, broken line endings, and broken words.
-- Preserve all names, facts, dates, places, numbers, and quotations.
-- Do not summarize.
-- Do not add information.
-- Remove page numbers, masthead fragments, captions that are unrelated to the article,
-  and clearly unrelated neighboring fragments.
-- If uncertain, preserve the original wording rather than guessing.
-- Return only the cleaned full article text.
+- Do NOT summarize. Return the full readable text.
+- Fix only obvious OCR errors: broken words, spacing, line wraps, and junk symbols.
+- Preserve all names, facts, dates, places, numbers, dialogue, and quotations.
+- Remove fabric/background OCR noise, illustration junk, page numbers, and unrelated fragments.
+- Keep paragraph breaks.
+- Do not invent missing sentences or facts.
+- If uncertain, keep the original wording.
+- Return only the cleaned full text.
 
-OCR article text:
-{cleaned[:12000]}
+OCR text:
+{cleaned[:14000]}
 
 Clean full text:
 """.strip()
 
-    result = ollama_generate(prompt, config, temperature=0.05, num_predict=1200)
-    return result if len(result.split()) >= 15 else cleaned
+    # Longer pages need more tokens than a short summary.
+    result = ollama_generate(
+        prompt,
+        config,
+        temperature=0.05,
+        num_predict=min(2200, max(400, len(cleaned.split()) * 3)),
+    )
+    result = prepare_readable_text(result, document_type) if result else ""
+    if len(result.split()) < max(10, int(0.35 * len(cleaned.split()))):
+        return cleaned
+    return result
 
 
 
@@ -2203,7 +2562,10 @@ def analyze_content(
                 )
             ]
     else:
-        full_text = best_full_page_ocr(prepared_gray, normalized_type)
+        full_text = prepare_readable_text(
+            best_full_page_ocr(prepared_gray, normalized_type),
+            normalized_type,
+        )
         title = "Full page"
         prediction = predict_category(
             model,
@@ -4113,8 +4475,11 @@ def analyze_content_hybrid(
             ]
 
     else:
-        full_text = best_full_page_ocr(
-            prepared_gray,
+        full_text = prepare_readable_text(
+            best_full_page_ocr(
+                prepared_gray,
+                normalized_type,
+            ),
             normalized_type,
         )
 
@@ -4573,11 +4938,46 @@ def remove_newspaper_artifacts(text: str) -> str:
     return value
 
 
+def prepare_readable_text(text: Any, document_type: Any = "") -> str:
+    """
+    Newspaper/Magazine: apply newspaper artifact cleanup.
+    Novel/Textbook/Letter/Report/General: keep OCR wording and paragraph
+    breaks, then drop fabric/illustration gibberish.
+    """
+    raw = "" if text is None else str(text)
+    if not raw.strip():
+        return ""
+
+    if normalize_document_type(document_type) in MULTI_CATEGORY_TYPES:
+        return remove_newspaper_artifacts(raw)
+
+    value = raw.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return filter_prose_text(value.strip())
+
+
 def clean_ocr_lines(lines: Iterable[str], document_type: str) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
+    newspaper_mode = normalize_document_type(document_type) in MULTI_CATEGORY_TYPES
 
     for raw in lines:
+        if not newspaper_mode:
+            # Preserve book/letter prose and blank lines (paragraph breaks).
+            line = str(raw or "").replace("\r", "").rstrip()
+            line = re.sub(r"[ \t]+", " ", line).strip() if line.strip() else ""
+            if not line:
+                if output and output[-1] != "":
+                    output.append("")
+                continue
+            if re.fullmatch(r"(?:page\s*)?[0-9o]{1,3}", line, flags=re.IGNORECASE):
+                continue
+            if re.fullmatch(r"[|;:=._-]{2,}", line):
+                continue
+            output.append(line)
+            continue
+
         line = re.sub(r"\s+", " ", clean_text_basic(raw)).strip()
 
         # Remove inline page markers before deciding whether line is useful.
@@ -6698,8 +7098,9 @@ def generate_selected_output(
             )
         )
 
-        source_text = remove_newspaper_artifacts(
-            item["full_text"]
+        source_text = prepare_readable_text(
+            item["full_text"],
+            analysis.get("document_type", ""),
         )
 
         if depth == "summary":
@@ -7202,13 +7603,12 @@ def analyze_content_hybrid(
             ]
 
     else:
-        full_text = best_full_page_ocr(
-            prepared_gray,
+        full_text = prepare_readable_text(
+            best_full_page_ocr(
+                prepared_gray,
+                normalized_type,
+            ),
             normalized_type,
-        )
-
-        full_text = remove_newspaper_artifacts(
-            full_text
         )
 
         title = "Full page"
@@ -9480,11 +9880,12 @@ def analyze_content_hybrid(
             ]
 
     else:
-        full_text = remove_newspaper_artifacts(
+        full_text = prepare_readable_text(
             best_full_page_ocr(
                 prepared_gray,
                 normalized_type,
-            )
+            ),
+            normalized_type,
         )
 
         prediction = predict_category(
@@ -11631,16 +12032,17 @@ def build_full_visible_capture_fallback_v5(
     document_type: str,
     page_shape: tuple[int, int],
 ) -> list[dict[str, Any]]:
-    full_text = remove_newspaper_artifacts(
+    full_text = prepare_readable_text(
         best_full_page_ocr(
             prepared_gray,
             document_type,
-        )
+        ),
+        document_type,
     )
 
     if not full_text:
-        full_text = remove_newspaper_artifacts(
-            " ".join(
+        full_text = prepare_readable_text(
+            "\n".join(
                 line.text
                 for line in sorted(
                     usable_lines,
@@ -11649,7 +12051,8 @@ def build_full_visible_capture_fallback_v5(
                         line.x1,
                     ),
                 )
-            )
+            ),
+            document_type,
         )
 
     synthetic_anchor = HeadlineAnchor(
@@ -20232,6 +20635,18 @@ class ApplicationFallbackConfig(AdaptiveReadingGraphConfig):
     # for comparison. Local is still the research component.
     prefer_openai_article_detection_first: bool = True
 
+    # For Novel/Textbook/Letter/Report/General, prefer vision page text
+    # first when OpenAI is available. Illustrated books and fabric
+    # backgrounds confuse Tesseract; vision recovers readable prose.
+    prefer_openai_full_page_text_first: bool = True
+
+    # When depth=full, clean OCR with local Ollama Llama (same stack as summary).
+    clean_full_text_with_llama: bool = True
+
+    # Mark local single-page OCR unreliable when too much fabric/art junk
+    # remains after filtering.
+    local_max_prose_noise_ratio: float = 0.34
+
     # ---------------------------------------------------------
     # Local article/content quality gate
     # ---------------------------------------------------------
@@ -20478,6 +20893,12 @@ def evaluate_local_analysis_v7(
         else 0.0
     )
 
+    joined_text = "\n\n".join(
+        str(item.get("full_text", "") or "")
+        for item in results
+    )
+    noise_ratio = prose_noise_ratio(joined_text)
+
     short_count = sum(
         count
         < config.local_short_article_word_threshold
@@ -20535,6 +20956,20 @@ def evaluate_local_analysis_v7(
     ):
         reasons.append(
             "very_low_local_text_quality"
+        )
+
+    max_noise = float(
+        getattr(config, "local_max_prose_noise_ratio", 0.34)
+    )
+    document_type = normalize_document_type(
+        analysis.get("document_type", "")
+    )
+    if (
+        document_type not in MULTI_CATEGORY_TYPES
+        and noise_ratio > max_noise
+    ):
+        reasons.append(
+            "noisy_local_ocr_from_background_or_illustrations"
         )
 
     if (
@@ -20620,6 +21055,10 @@ def evaluate_local_analysis_v7(
             ),
             "average_ocr_quality": round(
                 average_ocr_quality,
+                4,
+            ),
+            "prose_noise_ratio": round(
+                noise_ratio,
                 4,
             ),
             "short_article_ratio": round(
@@ -20727,7 +21166,13 @@ assistant.
 
 Document type: {document_type}
 
-Analyze ONLY the content visibly present in this camera image.
+Analyze ONLY the printed reading content visibly present on the page.
+
+Ignore completely:
+- patterned fabric / tablecloth / hands / room background around the page
+- illustrations, drawings, photos, decorative borders
+- page numbers in circles or corners unless they are part of a sentence
+- logos, watermarks, and non-text textures
 
 For Newspaper or Magazine:
 - First count every distinct visible EDITORIAL article on this page.
@@ -20746,11 +21191,15 @@ For Newspaper or Magazine:
   partial_top must be true.
 - If it continues below the image, partial_bottom must be true.
 
-For Novel/Story or another single reading document:
-- Return the visible reading content as one article/section.
+For Novel/Story, Textbook, Letter, Report, or another single reading document:
+- Return the visible printed story/body text as ONE article/section.
+- Reconstruct clean paragraph text only from the printed letters.
+- Do not invent words from drawings or background patterns.
+- Keep dialogue punctuation and paragraph breaks.
+- Title may be empty when the page has no chapter title.
 
 Text rules:
-- Transcribe/reconstruct only what is visible.
+- Transcribe/reconstruct only what is visible as printed text.
 - Keep names, numbers, dates, places, scores and facts.
 - Do NOT invent text hidden outside the image.
 - Do NOT invent missing beginning/endings.
@@ -20759,7 +21208,7 @@ Text rules:
 - If no headline is visible, return an empty title string.
 
 bbox_norm:
-- Approximate the visible editorial region in normalized coordinates
+- Approximate the visible editorial/text region in normalized coordinates
   from 0 to 1000, where (0,0) is top-left and (1000,1000) is bottom-right.
 """.strip()
 
@@ -21336,9 +21785,29 @@ def analyze_content_v7(
     )
 
     run_ai_first = (
-        bool(getattr(config, "prefer_openai_article_detection_first", True))
-        and normalized_type in MULTI_CATEGORY_TYPES
-        and fallback_available
+        fallback_available
+        and (
+            (
+                normalized_type in MULTI_CATEGORY_TYPES
+                and bool(
+                    getattr(
+                        config,
+                        "prefer_openai_article_detection_first",
+                        True,
+                    )
+                )
+            )
+            or (
+                normalized_type not in MULTI_CATEGORY_TYPES
+                and bool(
+                    getattr(
+                        config,
+                        "prefer_openai_full_page_text_first",
+                        True,
+                    )
+                )
+            )
+        )
     )
 
     ai_results_first: list[dict[str, Any]] = []
@@ -22022,11 +22491,15 @@ def generate_selected_output_v7(
         ollama_ready = False
 
     for item in selected_items:
-        source_text = remove_newspaper_artifacts(
+        source_text = prepare_readable_text(
             item.get(
                 "full_text",
                 "",
-            )
+            ),
+            analysis.get(
+                "document_type",
+                "",
+            ),
         )
 
         warnings = list(
@@ -22042,7 +22515,32 @@ def generate_selected_output_v7(
             content = source_text
             method = (
                 "visible_reconstructed_text"
+                if normalize_document_type(
+                    analysis.get("document_type", "")
+                )
+                in MULTI_CATEGORY_TYPES
+                else "preserved_full_page_ocr"
             )
+
+            # Same local-Llama path as summary, but cleans OCR instead of summarizing.
+            use_llama_full = bool(
+                getattr(config, "clean_full_text_with_llama", True)
+            )
+            if use_llama_full and ollama_ready and len(source_text.split()) >= 12:
+                try:
+                    cleaned_full = reconstruct_selected_text_with_llama(
+                        text=source_text,
+                        title=item.get("title", ""),
+                        document_type=analysis["document_type"],
+                        config=config,
+                    )
+                    if cleaned_full and len(cleaned_full.split()) >= 10:
+                        content = cleaned_full
+                        method = "local_llama_full_text_cleanup"
+                except Exception as error:
+                    warnings.append(
+                        f"Local Llama full-text cleanup failed: {error}"
+                    )
 
         else:
             content = ""

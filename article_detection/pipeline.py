@@ -66,6 +66,12 @@ CONFIG = ApplicationFallbackConfig(
     prefer_openai_article_detection_first=_bool_env(
         "PREFER_OPENAI_ARTICLE_DETECTION_FIRST", True
     ),
+    prefer_openai_full_page_text_first=_bool_env(
+        "PREFER_OPENAI_FULL_PAGE_TEXT_FIRST", True
+    ),
+    clean_full_text_with_llama=_bool_env(
+        "CLEAN_FULL_TEXT_WITH_LLAMA", True
+    ),
     debug=False,
 )
 

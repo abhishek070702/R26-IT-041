@@ -230,17 +230,21 @@ def run_novel_loop(preferences: Dict):
 def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
     """
     Newspaper flow:
-    First newspaper image can be sent directly to Harshaka after Abhishek name detection.
-    Later captures skip Abhishek newspaper-name detection and go to Harshaka only.
+    First captured image is used only for Abhishek newspaper-name detection.
+    It is NOT sent to Harshaka, because full newspaper captures often make text too small.
+    Harshaka needs a second close capture of one clear article area.
     """
     if first_image_path is not None:
-        speak("Reading newspaper articles from the captured area.", preferences)
+        print("First newspaper image was used for Abhishek only:", first_image_path)
 
-        run_harshaka_reading_for_image(
-            image_path=first_image_path,
-            document_type="Newspaper",
-            preferences=preferences,
-        )
+    speak(
+        "Newspaper name detection completed. Now move the camera closer to one article area.",
+        preferences,
+    )
+    speak(
+        "Make sure the article headline and body letters are clear before capture.",
+        preferences,
+    )
 
     while True:
         choice = ask_continue_or_stop(preferences)
@@ -255,7 +259,7 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
 
         image_path = get_latest_captured_image_path()
         if image_path is None:
-            speak("Captured newspaper image was not found.", preferences)
+            speak("Captured newspaper article image was not found.", preferences)
             continue
 
         run_harshaka_reading_for_image(
@@ -264,7 +268,8 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
             preferences=preferences,
         )
 
-        speak("Newspaper area reading completed.", preferences)
+        speak("Newspaper article reading completed.", preferences)
+        speak("Move to another article and say ready, or say stop to finish.", preferences)
 
 
 def main():

@@ -265,7 +265,22 @@ def listen_once(max_seconds: int = 8) -> str:
         return input("Voice input failed. Type answer: ").strip().lower()
 
 
+def _phrase_in_answer(phrase: str, answer_text: str) -> bool:
+    phrase = str(phrase).lower().strip()
+    answer_text = str(answer_text).lower().strip()
+
+    if not phrase:
+        return False
+
+    pattern = r"\b" + re.escape(phrase) + r"\b"
+    return re.search(pattern, answer_text) is not None
+
+
 def _match_answer(answer_text: str, valid_answers: List[str]):
+    """
+    Match recognized/typed answer to allowed answers safely.
+    Avoids bug where 'female' becomes 'male'.
+    """
     answer_text = str(answer_text).lower().strip()
     answer_compact = _compact(answer_text)
 
@@ -296,23 +311,28 @@ def _match_answer(answer_text: str, valid_answers: List[str]):
         "mathematics": ["mathematics", "maths", "math"],
     }
 
+    # 1. Exact match first
     for valid in valid_answers:
         valid_lower = str(valid).lower().strip()
-        valid_compact = _compact(valid_lower)
+        if answer_text == valid_lower or answer_compact == _compact(valid_lower):
+            return valid
 
-        if valid_compact and (
-            valid_compact in answer_compact
-            or answer_compact in valid_compact
-        ):
+    # 2. Exact alias match
+    for valid in valid_answers:
+        valid_lower = str(valid).lower().strip()
+        for alias in aliases.get(valid_lower, []):
+            if answer_text == alias or answer_compact == _compact(alias):
+                return valid
+
+    # 3. Word/phrase match only. No unsafe substring match.
+    for valid in valid_answers:
+        valid_lower = str(valid).lower().strip()
+
+        if _phrase_in_answer(valid_lower, answer_text):
             return valid
 
         for alias in aliases.get(valid_lower, []):
-            alias_compact = _compact(alias)
-
-            if alias_compact and (
-                alias_compact in answer_compact
-                or answer_compact in alias_compact
-            ):
+            if _phrase_in_answer(alias, answer_text):
                 return valid
 
     return None

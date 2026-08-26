@@ -1,8 +1,11 @@
 import {
+  BookOpen,
   Brain,
   Camera,
   Eye,
+  FileText,
   Mic,
+  Newspaper,
   Radio,
   ScanLine,
   Sparkles,
@@ -11,13 +14,19 @@ import {
 } from "lucide-react";
 import Reveal from "./Reveal";
 import { useLiveStatus } from "../hooks/useLiveStatus";
-import { MODULE_STATUS_VARIANT } from "../liveDemoStatus";
+import {
+  MODULE_STATUS_VARIANT,
+  formatModuleLabel,
+  formatModuleStatus,
+  usefulEventDetails,
+} from "../liveDemoStatus";
 
 const MODULE_ICONS = {
   manoj: Camera,
   abhishek: Eye,
   harshaka: Brain,
   rashmi: Mic,
+  system: Sparkles,
 };
 
 function formatTimestamp(value) {
@@ -33,6 +42,187 @@ function formatTimestamp(value) {
   return parsed.toLocaleString();
 }
 
+function formatEventTime(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function displayValue(value) {
+  return value ? value : "—";
+}
+
+function ResultRow({ label, value }) {
+  return (
+    <div className="vr-live__result-row">
+      <span>{label}</span>
+      <strong>{displayValue(value)}</strong>
+    </div>
+  );
+}
+
+function DocumentResultPanel({ output }) {
+  const kind = output.documentKind;
+
+  if (kind === "newspaper") {
+    return (
+      <>
+        <h3>Document Result Panel</h3>
+        <p className="vr-live__panel-kicker">
+          <Newspaper size={14} aria-hidden="true" />
+          Newspaper workflow
+        </p>
+        <div className="vr-live__result-list">
+          <ResultRow label="Newspaper Name" value={output.title} />
+          <ResultRow label="Selected Category" value={output.selectedCategory} />
+          <ResultRow label="Selected Mode" value={output.selectedMode} />
+          <ResultRow
+            label="Article/Image Description"
+            value={output.pageImageDescription}
+          />
+        </div>
+      </>
+    );
+  }
+
+  if (kind === "report" || kind === "printed_letter") {
+    return (
+      <>
+        <h3>Document Result Panel</h3>
+        <p className="vr-live__panel-kicker">
+          <FileText size={14} aria-hidden="true" />
+          {kind === "report" ? "Report workflow" : "Printed letter workflow"}
+        </p>
+        <div className="vr-live__result-list">
+          <ResultRow label="Document Type" value={output.documentType} />
+          <ResultRow
+            label="Output Preview"
+            value={output.outputText || output.speechText}
+          />
+          <ResultRow
+            label="Image Description"
+            value={output.imageDescription || output.pageImageDescription}
+          />
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <h3>Document Result Panel</h3>
+      <p className="vr-live__panel-kicker">
+        <BookOpen size={14} aria-hidden="true" />
+        {kind === "magazine" ? "Magazine workflow" : "Novel workflow"}
+      </p>
+      <div className="vr-live__result-list">
+        <ResultRow label="Document Type" value={output.documentType} />
+        <ResultRow label="Title" value={output.title} />
+        <ResultRow label="Cover Description" value={output.coverDescription} />
+        <ResultRow
+          label="Current Page"
+          value={
+            output.currentPage
+              ? `${output.currentPage}${output.pageType ? ` · ${output.pageType}` : ""}`
+              : output.pageType
+          }
+        />
+        <ResultRow
+          label="Page Image Description"
+          value={output.pageImageDescription}
+        />
+      </div>
+    </>
+  );
+}
+
+function WorkflowTimeline({ events, timeline }) {
+  const eventItems = events.length
+    ? events
+    : timeline.map((step) => ({
+        id: step.id,
+        module: "system",
+        status:
+          step.state === "complete"
+            ? "ready"
+            : step.state === "active"
+              ? "running"
+              : "waiting",
+        message: step.label,
+        time: "",
+        details: {},
+      }));
+
+  return (
+    <>
+      <h3>Live Workflow Timeline</h3>
+      <p className="vr-live__panel-kicker">
+        Step-by-step device events from the live status API
+      </p>
+      {eventItems.length ? (
+        <ol className="vr-live__events">
+          {eventItems.map((event) => {
+            const Icon = MODULE_ICONS[event.module] || Sparkles;
+            const details = usefulEventDetails(event.details);
+            const statusLabel = formatModuleStatus(event.status);
+            const variant = MODULE_STATUS_VARIANT[statusLabel] || "waiting";
+
+            return (
+              <li
+                key={event.id}
+                className={`vr-live__event vr-live__event--${event.status}`}
+              >
+                <span className="vr-live__event-rail" aria-hidden="true">
+                  <span className="vr-live__event-dot" />
+                </span>
+                <div className="vr-live__event-body">
+                  <div className="vr-live__event-head">
+                    <span className="vr-live__event-module">
+                      <Icon size={14} aria-hidden="true" />
+                      {formatModuleLabel(event.module)}
+                    </span>
+                    <span className={`vr-live__badge vr-live__badge--${variant}`}>
+                      {statusLabel}
+                    </span>
+                  </div>
+                  <p className="vr-live__event-message">{event.message}</p>
+                  {event.time ? (
+                    <time className="vr-live__event-time" dateTime={event.time}>
+                      {formatEventTime(event.time)}
+                    </time>
+                  ) : null}
+                  {details.length ? (
+                    <div className="vr-live__event-details">
+                      {details.map((item) => (
+                        <span key={`${event.id}-${item.key}`}>
+                          <strong>{item.key}</strong> {item.value}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      ) : (
+        <p className="vr-live__empty">Waiting for workflow events…</p>
+      )}
+    </>
+  );
+}
+
 export default function LiveDeviceWorkflow() {
   const {
     connectionState,
@@ -40,6 +230,7 @@ export default function LiveDeviceWorkflow() {
     device,
     modules,
     timeline,
+    events,
     output,
     error,
     lastUpdated,
@@ -50,8 +241,15 @@ export default function LiveDeviceWorkflow() {
     connectionState === "connected"
       ? "vr-live__badge--connected"
       : connectionState === "waiting"
-        ? "vr-live__badge--demo"
+        ? "vr-live__badge--waiting"
         : "vr-live__badge--demo";
+
+  const badgeLabel =
+    connectionState === "connected"
+      ? "Live"
+      : connectionState === "waiting"
+        ? "Waiting"
+        : "Demo";
 
   return (
     <section className="vr-live" id="live-workflow">
@@ -66,7 +264,7 @@ export default function LiveDeviceWorkflow() {
           </div>
           <span className={`vr-live__badge ${badgeClass}`}>
             <Sparkles size={14} aria-hidden="true" />
-            {connectionState === "connected" ? "Live" : "Demo"}
+            {badgeLabel}
           </span>
         </div>
         <div className="vr-live__status-grid">
@@ -95,6 +293,9 @@ export default function LiveDeviceWorkflow() {
         <p className="vr-live__meta-line">
           <span>
             <strong>Active module</strong> {activeModule || "none"}
+          </span>
+          <span>
+            <strong>Workflow stage</strong> {displayValue(device.workflowStage)}
           </span>
           <span>
             <strong>Last updated</strong> {formatTimestamp(lastUpdated)}
@@ -130,50 +331,31 @@ export default function LiveDeviceWorkflow() {
       </div>
 
       <div className="vr-live__panels">
-        <Reveal variant="left" delay={60} className="vr-live__panel">
-          <h3>Pipeline timeline</h3>
-          <ol className="vr-live__timeline">
-            {timeline.map((step) => (
-              <li
-                key={step.id}
-                className={`vr-live__timeline-item vr-live__timeline-item--${step.state}`}
-              >
-                <span className="vr-live__timeline-dot" aria-hidden="true" />
-                <span>{step.label}</span>
-              </li>
-            ))}
-          </ol>
+        <Reveal variant="left" delay={60} className="vr-live__panel vr-live__panel--timeline">
+          <WorkflowTimeline events={events} timeline={timeline} />
         </Reveal>
 
         <Reveal variant="right" delay={120} className="vr-live__panel vr-live__panel--output">
-          <h3>Live output preview</h3>
-          <div className="vr-live__output-meta">
-            <span>
-              <strong>Type</strong> {output.documentType || "—"}
-            </span>
-            <span>
-              <strong>Title</strong> {output.title || "—"}
-            </span>
-            <span>
-              <strong>Category</strong> {output.category || "—"}
-            </span>
-          </div>
+          <DocumentResultPanel output={output} />
           <div className="vr-live__prefs">
             <span>{output.readingLevel || "—"} reading</span>
             <span>{output.voice || "—"} voice</span>
             <span>{output.pace || "—"} pace</span>
             <span>{output.tone || "—"} tone</span>
           </div>
-          <div className="vr-live__spoken">
-            <Volume2 size={18} aria-hidden="true" />
-            <p>{output.spokenText}</p>
-          </div>
-          <p className="vr-live__image-desc">
-            <Eye size={16} aria-hidden="true" />
-            {output.imageDescription}
-          </p>
         </Reveal>
       </div>
+
+      <Reveal variant="up" delay={160} className="vr-live__panel vr-live__panel--speech">
+        <h3>Speech Output</h3>
+        <p className="vr-live__panel-kicker">
+          What Rashmi is speaking to the user
+        </p>
+        <div className="vr-live__spoken">
+          <Volume2 size={18} aria-hidden="true" />
+          <p>{output.spokenText}</p>
+        </div>
+      </Reveal>
     </section>
   );
 }

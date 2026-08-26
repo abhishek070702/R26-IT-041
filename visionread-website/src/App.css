@@ -2008,9 +2008,24 @@
 }
 
 .vr-live__panel h3 {
-  margin: 0 0 24px;
+  margin: 0 0 8px;
   font-size: 1.25rem;
   font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+.vr-live__panel-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 22px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.vr-live__panel-kicker svg {
+  flex-shrink: 0;
   color: var(--accent-cyan);
 }
 
@@ -2018,6 +2033,188 @@
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+.vr-live__events {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 560px;
+  overflow-y: auto;
+}
+
+.vr-live__event {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 14px;
+  padding: 0 0 18px;
+}
+
+.vr-live__event:last-child {
+  padding-bottom: 0;
+}
+
+.vr-live__event-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.vr-live__event-rail::after {
+  content: "";
+  position: absolute;
+  top: 14px;
+  bottom: -18px;
+  left: 50%;
+  width: 1px;
+  background: var(--border);
+  transform: translateX(-50%);
+}
+
+.vr-live__event:last-child .vr-live__event-rail::after {
+  display: none;
+}
+
+.vr-live__event-dot {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.03);
+}
+
+.vr-live__event--ready .vr-live__event-dot {
+  background: var(--accent-green);
+  box-shadow: 0 0 12px rgba(48, 209, 88, 0.45);
+}
+
+.vr-live__event--running .vr-live__event-dot {
+  background: var(--accent-cyan);
+  box-shadow: 0 0 12px rgba(100, 210, 255, 0.55);
+  animation: vr-live-pulse 2s ease-in-out infinite;
+}
+
+.vr-live__event--error .vr-live__event-dot {
+  background: #ff6b6b;
+  box-shadow: 0 0 12px rgba(255, 107, 107, 0.45);
+}
+
+.vr-live__event-body {
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.vr-live__event-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.vr-live__event-module {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+}
+
+.vr-live__event-message {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.vr-live__event-time {
+  display: block;
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.vr-live__event-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.vr-live__event-details span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+}
+
+.vr-live__event-details strong {
+  margin-right: 4px;
+  text-transform: capitalize;
+  color: var(--text-dim);
+}
+
+.vr-live__empty {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.vr-live__result-list {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.vr-live__result-row {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.vr-live__result-row:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.vr-live__result-row span {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.vr-live__result-row strong {
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.vr-live__panel--speech {
+  margin-top: 20px;
+  text-align: left;
+  background: linear-gradient(160deg, rgba(17, 17, 24, 0.98), rgba(48, 209, 88, 0.05));
+}
+
+.vr-live__panel--speech .vr-live__spoken {
+  margin-bottom: 0;
 }
 
 .vr-live__timeline-item {

@@ -1,4 +1,5 @@
-﻿import { useEffect, useRef, useState } from "react";
+﻿import { useState } from "react";
+import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
 import {
   ArrowRight,
   BookOpen,
@@ -8,30 +9,24 @@ import {
   Eye,
   FileText,
   Layers,
-  Menu,
   Mic,
   Newspaper,
   Plus,
   Radio,
   ScanLine,
   Volume2,
-  X,
 } from "lucide-react";
 import "./App.css";
-
-const PRODUCT_HEADSET = "/images/product-headset.png";
-const PRODUCT_WORN = "/images/product-worn.png";
-const DEMO_FORBES_MAGAZINE = "/images/demo-forbes-magazine.png";
-const LOGO_ICON = "/images/logo-icon.png";
-const LOGO_WORDMARK = "/images/logo-wordmark.png";
-const ERYN_NAME = "Eryn Technologies";
-
-const NAV = [
-  { href: "#overview", label: "Overview" },
-  { href: "#experience", label: "Experience" },
-  { href: "#technology", label: "Technology" },
-  { href: "#demo", label: "Demo" },
-];
+import Reveal from "./components/Reveal";
+import SiteShell from "./components/SiteShell";
+import {
+  DEMO_FORBES_MAGAZINE,
+  LOGO_ICON,
+  LOGO_WORDMARK,
+  PRODUCT_HEADSET,
+  PRODUCT_WORN,
+} from "./constants";
+import LiveDemoPage from "./pages/LiveDemoPage";
 
 const STATEMENT = [
   "VisionRead seamlessly blends camera sensing with document intelligence.",
@@ -236,51 +231,6 @@ const DEMO = [
   },
 ];
 
-function useReveal(threshold = 0.12) {
-  const ref = useRef(null);
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return undefined;
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setVisible(true);
-          observer.unobserve(el);
-        }
-      },
-      { threshold, rootMargin: "0px 0px -6% 0px" },
-    );
-
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [threshold]);
-
-  return [ref, visible];
-}
-
-function Reveal({
-  children,
-  className = "",
-  delay = 0,
-  variant = "up",
-  as: Tag = "div",
-}) {
-  const [ref, visible] = useReveal();
-
-  return (
-    <Tag
-      ref={ref}
-      className={`vr-reveal vr-reveal--${variant}${visible ? " vr-reveal--visible" : ""}${className ? ` ${className}` : ""}`}
-      style={{ "--reveal-delay": `${delay}ms` }}
-    >
-      {children}
-    </Tag>
-  );
-}
-
 function ProductPhoto({ src, alt, className }) {
   const [failed, setFailed] = useState(false);
 
@@ -358,104 +308,9 @@ function DeviceVisual({ variant }) {
   );
 }
 
-function App() {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [navSolid, setNavSolid] = useState(false);
-
-  useEffect(() => {
-    history.scrollRestoration = "manual";
-
-    const navEntry = performance.getEntriesByType("navigation")[0];
-    const isReload = navEntry?.type === "reload";
-    const scrollTop = () => window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-
-    if (isReload) {
-      const { pathname, search } = window.location;
-      if (window.location.hash) {
-        history.replaceState(null, "", pathname + search);
-      }
-      scrollTop();
-      requestAnimationFrame(scrollTop);
-    }
-  }, []);
-
-  useEffect(() => {
-    const onScroll = () => setNavSolid(window.scrollY > 48);
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-
-  useEffect(() => {
-    document.body.style.overflow = menuOpen ? "hidden" : "";
-    return () => {
-      document.body.style.overflow = "";
-    };
-  }, [menuOpen]);
-
-  const closeMenu = () => setMenuOpen(false);
-
+function HomePage() {
   return (
-    <div className="vr vr-ready">
-      <div className="vr-bg" aria-hidden="true">
-        <span className="vr-bg__orb vr-bg__orb--1" />
-        <span className="vr-bg__orb vr-bg__orb--2" />
-        <span className="vr-bg__grid" />
-      </div>
-
-      <header className={`vr-nav ${navSolid ? "vr-nav--solid" : ""}`}>
-        <a href="#top" className="vr-nav__logo" onClick={closeMenu}>
-          <img
-            src={LOGO_WORDMARK}
-            alt="VisionRead"
-            className="vr-logo vr-logo--nav-wordmark"
-          />
-          <img
-            src={LOGO_ICON}
-            alt="VisionRead"
-            className="vr-logo vr-logo--nav-icon"
-          />
-        </a>
-
-        <nav className="vr-nav__center" aria-label="Main">
-          {NAV.map((item) => (
-            <a key={item.href} href={item.href}>
-              {item.label}
-            </a>
-          ))}
-        </nav>
-
-        <div className="vr-nav__right">
-          <a href="#research" className="vr-nav__pill">
-            Research Prototype
-          </a>
-          <a href="#demo" className="vr-nav__cta">
-            View Demo
-          </a>
-          <button
-            type="button"
-            className="vr-nav__menu"
-            aria-label={menuOpen ? "Close menu" : "Open menu"}
-            onClick={() => setMenuOpen((v) => !v)}
-          >
-            {menuOpen ? <X size={20} /> : <Menu size={20} />}
-          </button>
-        </div>
-      </header>
-
-      <div className={`vr-drawer ${menuOpen ? "vr-drawer--open" : ""}`}>
-        {NAV.map((item) => (
-          <a key={item.href} href={item.href} onClick={closeMenu}>
-            {item.label}
-            <ChevronRight size={18} />
-          </a>
-        ))}
-        <a href="#demo" onClick={closeMenu}>
-          View Demo
-          <ChevronRight size={18} />
-        </a>
-      </div>
-
-      <main>
+    <SiteShell activePage="home">
         {/* Hero — Meta / Apple product launch style */}
         <section className="vr-hero" id="top">
           <p className="vr-hero__eyebrow vr-enter" style={{ "--enter-i": 0 }}>Assistive AI Reader · Research Prototype</p>
@@ -486,9 +341,9 @@ function App() {
               Take a closer look
               <ChevronRight size={18} />
             </a>
-            <a href="#demo" className="vr-link">
-              View demo flows
-            </a>
+            <Link to="/live-demo" className="vr-link">
+              Open live demo
+            </Link>
           </div>
 
           <div className="vr-hero__product vr-enter vr-enter--float" style={{ "--enter-i": 10 }}>
@@ -825,33 +680,17 @@ function App() {
             </a>
           </div>
         </Reveal>
-      </main>
-
-      <footer className="vr-footer">
-        <div className="vr-footer__top">
-          <div className="vr-footer__brand">
-            <img src={LOGO_ICON} alt="" className="vr-logo vr-logo--footer" />
-            <div>
-              <strong>VisionRead</strong>
-              <span>Assistive AI Reader · Research Prototype</span>
-            </div>
-          </div>
-          <nav aria-label="Footer">
-            <a href="#overview">Overview</a>
-            <a href="#experience">Experience</a>
-            <a href="#technology">Technology</a>
-            <a href="#research">Research</a>
-          </nav>
-        </div>
-        <p>
-          © 2026 {ERYN_NAME}. All rights reserved. · VisionRead · Smart Wearable Reading Assistant · Research Prototype · R26-IT-041
-        </p>
-        <p className="vr-footer__note">
-          This website presents a final-year research prototype. Not available for commercial purchase.
-        </p>
-      </footer>
-    </div>
+    </SiteShell>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<HomePage />} />
+        <Route path="/live-demo" element={<LiveDemoPage />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}

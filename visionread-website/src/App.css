@@ -1,0 +1,275 @@
+﻿.site {
+  width: min(1180px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 24px 0 40px;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px;
+  border: 1px solid rgba(160, 218, 255, 0.16);
+  border-radius: 24px;
+  background: rgba(7, 17, 31, 0.78);
+  backdrop-filter: blur(18px);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logoIcon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #22d3ee, #2563eb);
+}
+
+.logo h2,
+.logo p {
+  margin: 0;
+}
+
+.logo p,
+.hero p,
+.card p,
+.workflow p,
+.team p,
+footer p {
+  color: #a9b8c8;
+}
+
+.links {
+  display: flex;
+  gap: 24px;
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 56px;
+  align-items: center;
+  min-height: 700px;
+}
+
+.badge {
+  display: inline-flex;
+  width: fit-content;
+  padding: 9px 13px;
+  border: 1px solid rgba(103, 232, 249, 0.22);
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.09);
+  color: #7dd3fc;
+  font-weight: 700;
+}
+
+.hero h1 {
+  margin: 22px 0 18px;
+  max-width: 760px;
+  font-size: clamp(2.8rem, 7vw, 5.7rem);
+  line-height: 0.95;
+  letter-spacing: -0.08em;
+}
+
+.hero p {
+  max-width: 640px;
+  line-height: 1.75;
+  font-size: 1.14rem;
+}
+
+.buttons {
+  display: flex;
+  gap: 14px;
+  margin-top: 32px;
+}
+
+.primary,
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 50px;
+  padding: 0 20px;
+  border-radius: 16px;
+  font-weight: 800;
+}
+
+.primary {
+  background: linear-gradient(135deg, #22d3ee, #2563eb);
+  color: white;
+}
+
+.secondary {
+  border: 1px solid rgba(180, 216, 255, 0.18);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-top: 46px;
+}
+
+.stats div,
+.card,
+.team div,
+.steps,
+.device {
+  border: 1px solid rgba(160, 218, 255, 0.14);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.stats div {
+  padding: 18px;
+}
+
+.stats strong {
+  display: block;
+  color: #67e8f9;
+  font-size: 2rem;
+}
+
+.stats span {
+  color: #96a8ba;
+}
+
+.deviceCard {
+  display: grid;
+  place-items: center;
+}
+
+.device {
+  width: min(380px, 100%);
+  min-height: 420px;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-shadow: 0 0 90px rgba(34, 211, 238, 0.16);
+}
+
+.cameraDot {
+  width: 18px;
+  height: 18px;
+  margin: 0 auto 50px;
+  border-radius: 999px;
+  background: #38bdf8;
+  box-shadow: 0 0 24px #38bdf8;
+}
+
+.device span {
+  color: #67e8f9;
+  font-weight: 800;
+}
+
+.device h3 {
+  margin: 14px 0;
+  font-size: 2.4rem;
+}
+
+.section {
+  padding: 84px 0;
+}
+
+.heading {
+  max-width: 720px;
+  margin: 0 auto 42px;
+  text-align: center;
+}
+
+.heading span {
+  color: #67e8f9;
+  font-weight: 800;
+}
+
+.heading h2,
+.workflow h2 {
+  margin: 16px 0;
+  font-size: clamp(2rem, 4vw, 3.3rem);
+  line-height: 1.05;
+  letter-spacing: -0.05em;
+}
+
+.grid,
+.team {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+.card,
+.team div {
+  padding: 26px;
+}
+
+.icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: rgba(34, 211, 238, 0.12);
+  color: #67e8f9;
+}
+
+.workflow {
+  display: grid;
+  grid-template-columns: 0.9fr 1.1fr;
+  gap: 40px;
+  align-items: center;
+}
+
+.steps {
+  padding: 18px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px;
+}
+
+.step span {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 15px;
+  background: rgba(34, 211, 238, 0.1);
+  color: #67e8f9;
+  font-weight: 900;
+}
+
+.step p {
+  margin: 0;
+  font-weight: 800;
+}
+
+footer {
+  padding: 30px 0 0;
+  border-top: 1px solid rgba(160, 218, 255, 0.12);
+}
+
+@media (max-width: 900px) {
+  .hero,
+  .workflow {
+    grid-template-columns: 1fr;
+  }
+
+  .grid,
+  .team,
+  .stats {
+    grid-template-columns: 1fr;
+  }
+
+  .links {
+    display: none;
+  }
+}

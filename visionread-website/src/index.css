@@ -5,16 +5,26 @@
 }
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  color: #eaf7ff;
-  background: #07111f;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: radial-gradient(circle at top left, rgba(31, 169, 255, 0.18), transparent 35%), radial-gradient(circle at bottom right, rgba(77, 255, 199, 0.12), transparent 35%), #07111f;
+  background: #000;
 }
 
 a {
@@ -24,4 +34,8 @@ a {
 
 button {
   font-family: inherit;
+}
+
+h1, h2, h3, h4, p {
+  margin: 0;
 }

@@ -10,7 +10,8 @@ import {
   Wifi,
 } from "lucide-react";
 import Reveal from "./Reveal";
-import { liveDemoStatus, MODULE_STATUS_VARIANT } from "../liveDemoStatus";
+import { useLiveStatus } from "../hooks/useLiveStatus";
+import { MODULE_STATUS_VARIANT } from "../liveDemoStatus";
 
 const MODULE_ICONS = {
   manoj: Camera,
@@ -19,8 +20,38 @@ const MODULE_ICONS = {
   rashmi: Mic,
 };
 
+function formatTimestamp(value) {
+  if (!value) {
+    return "Not updated yet";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString();
+}
+
 export default function LiveDeviceWorkflow() {
-  const { device, modules, timeline, output } = liveDemoStatus;
+  const {
+    connectionState,
+    connectionLabel,
+    device,
+    modules,
+    timeline,
+    output,
+    error,
+    lastUpdated,
+    activeModule,
+  } = useLiveStatus();
+
+  const badgeClass =
+    connectionState === "connected"
+      ? "vr-live__badge--connected"
+      : connectionState === "waiting"
+        ? "vr-live__badge--demo"
+        : "vr-live__badge--demo";
 
   return (
     <section className="vr-live" id="live-workflow">
@@ -29,10 +60,13 @@ export default function LiveDeviceWorkflow() {
           <div>
             <p className="vr-live__label">Device status</p>
             <h3>{device.name}</h3>
+            <p className={`vr-live__api-label vr-live__api-label--${connectionState}`}>
+              {connectionLabel}
+            </p>
           </div>
-          <span className="vr-live__badge vr-live__badge--demo">
+          <span className={`vr-live__badge ${badgeClass}`}>
             <Sparkles size={14} aria-hidden="true" />
-            Demo mode
+            {connectionState === "connected" ? "Live" : "Demo"}
           </span>
         </div>
         <div className="vr-live__status-grid">
@@ -58,6 +92,19 @@ export default function LiveDeviceWorkflow() {
             </div>
           </div>
         </div>
+        <p className="vr-live__meta-line">
+          <span>
+            <strong>Active module</strong> {activeModule || "none"}
+          </span>
+          <span>
+            <strong>Last updated</strong> {formatTimestamp(lastUpdated)}
+          </span>
+        </p>
+        {error ? (
+          <p className="vr-live__error" role="status">
+            {error}
+          </p>
+        ) : null}
       </Reveal>
 
       <div className="vr-live__modules">
@@ -102,20 +149,20 @@ export default function LiveDeviceWorkflow() {
           <h3>Live output preview</h3>
           <div className="vr-live__output-meta">
             <span>
-              <strong>Type</strong> {output.documentType}
+              <strong>Type</strong> {output.documentType || "—"}
             </span>
             <span>
-              <strong>Title</strong> {output.title}
+              <strong>Title</strong> {output.title || "—"}
             </span>
             <span>
-              <strong>Category</strong> {output.category}
+              <strong>Category</strong> {output.category || "—"}
             </span>
           </div>
           <div className="vr-live__prefs">
-            <span>{output.readingLevel} reading</span>
-            <span>{output.voice} voice</span>
-            <span>{output.pace} pace</span>
-            <span>{output.tone} tone</span>
+            <span>{output.readingLevel || "—"} reading</span>
+            <span>{output.voice || "—"} voice</span>
+            <span>{output.pace || "—"} pace</span>
+            <span>{output.tone || "—"} tone</span>
           </div>
           <div className="vr-live__spoken">
             <Volume2 size={18} aria-hidden="true" />

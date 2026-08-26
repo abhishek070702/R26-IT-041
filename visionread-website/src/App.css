@@ -1875,6 +1875,65 @@
   border: 1px solid var(--border);
 }
 
+.vr-live__badge--error {
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.25);
+}
+
+.vr-live__badge--connected {
+  color: var(--accent-green);
+  background: rgba(48, 209, 88, 0.12);
+  border: 1px solid rgba(48, 209, 88, 0.25);
+}
+
+.vr-live__api-label {
+  margin: 10px 0 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.vr-live__api-label--connected {
+  color: var(--accent-green);
+}
+
+.vr-live__api-label--waiting {
+  color: var(--accent-cyan);
+}
+
+.vr-live__api-label--fallback {
+  color: #ffb347;
+}
+
+.vr-live__meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  margin: 18px 0 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.vr-live__meta-line strong {
+  margin-right: 6px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+}
+
+.vr-live__error {
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 107, 107, 0.25);
+  background: rgba(255, 107, 107, 0.08);
+  color: #ffb4b4;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
 @keyframes vr-live-pulse {
   0%,
   100% {

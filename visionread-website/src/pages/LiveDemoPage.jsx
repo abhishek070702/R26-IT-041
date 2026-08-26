@@ -16,8 +16,8 @@ export default function LiveDemoPage() {
           <p className="vr-eyebrow">Live device workflow</p>
           <h1>Watch the wearable pipeline run.</h1>
           <p className="vr-live-page__intro">
-            Mock status from the integrated Rashmi → Manoj → Abhishek → Harshaka flow.
-            Connect your Pi backend later — the UI is ready for live updates.
+            Polls the integrated PP2 workflow from Rashmi → Manoj → Abhishek → Harshaka.
+            When the backend is running, this page updates every second from the live status API.
           </p>
         </Reveal>
 

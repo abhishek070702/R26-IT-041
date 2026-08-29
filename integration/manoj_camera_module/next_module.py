@@ -84,6 +84,7 @@ def main():
 
     if TARGET_MODULE in ["capture_only", "capture", "none"]:
         print("Capture-only mode. Image saved for main controller.")
+        print("Not sending to Abhishek or Harshaka.")
         return
 
     if TARGET_MODULE in ["abhishek", "cover", "first"]:

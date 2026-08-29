@@ -70,6 +70,7 @@ async def describe_uploaded_image(
     Intended for:
       - novel_cover
       - novel_page illustrations
+      - magazine_page
       - newspaper_article_image (cropped article photo from Harshaka)
       - newspaper_page
       - general

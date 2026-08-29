@@ -176,7 +176,9 @@ def run_laptop_test(image_path: str, document_type: str):
         if not selected_category:
             selected_category = categories[0]
     else:
-        selected_category = "Story" if "novel" in document_type.lower() else "General Text"
+        print("No readable content was found for this page.")
+        print("Laptop test will not invent Story or General Text.")
+        return
 
     depth = input("Type summary or full: ").strip().lower()
     if depth not in ["summary", "full"]:

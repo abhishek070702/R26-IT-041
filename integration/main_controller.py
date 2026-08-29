@@ -75,9 +75,10 @@ ABHISHEK_ANALYZE_URL = os.getenv(
     "ABHISHEK_API_URL",
     "http://127.0.0.1:8000/abhishek/analyze",
 )
-ABHISHEK_DESCRIBE_URL = os.getenv(
-    "ABHISHEK_DESCRIBE_URL",
-    ABHISHEK_ANALYZE_URL.replace("/abhishek/analyze", "/abhishek/describe-image"),
+ABHISHEK_DESCRIBE_URL = (
+    os.getenv("ABHISHEK_DESCRIBE_IMAGE_URL")
+    or os.getenv("ABHISHEK_DESCRIBE_URL")
+    or ABHISHEK_ANALYZE_URL.replace("/abhishek/analyze", "/abhishek/describe-image")
 )
 
 WEAK_TITLE_MARKERS = (
@@ -513,7 +514,7 @@ def run_magazine_loop(preferences: Dict):
         turn_page_message="Please turn to the next page of the magazine.",
         continue_question="Say next to continue to the next page, or say stop to finish.",
         stop_message="Magazine reading stopped.",
-        describe_context="general",
+        describe_context="magazine_page",
         missing_image_message="Captured page image was not found.",
     )
 
@@ -560,6 +561,28 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
         )
 
         speak("Move to another article and say next, or say stop to finish.", preferences)
+
+
+def run_report_flow(image_path: Optional[Path], preferences: Dict):
+    run_single_image_document(
+        image_path=image_path,
+        document_type="Report",
+        preferences=preferences,
+        ask_depth=True,
+        default_depth="summary",
+        describe_context="general",
+    )
+
+
+def run_printed_letter_flow(image_path: Optional[Path], preferences: Dict):
+    run_single_image_document(
+        image_path=image_path,
+        document_type="Printed_Letter",
+        preferences=preferences,
+        ask_depth=False,
+        default_depth="full",
+        describe_context="general",
+    )
 
 
 def run_single_image_document(
@@ -625,23 +648,9 @@ def main():
     elif document_type == "Newspaper":
         run_newspaper_loop(first_image_path, preferences)
     elif document_type == "Report":
-        run_single_image_document(
-            image_path=first_image_path,
-            document_type="Report",
-            preferences=preferences,
-            ask_depth=True,
-            default_depth="summary",
-            describe_context="general",
-        )
+        run_report_flow(first_image_path, preferences)
     elif document_type == "Printed_Letter":
-        run_single_image_document(
-            image_path=first_image_path,
-            document_type="Printed_Letter",
-            preferences=preferences,
-            ask_depth=False,
-            default_depth="full",
-            describe_context="general",
-        )
+        run_printed_letter_flow(first_image_path, preferences)
     else:
         speak(
             "The document type could not be identified clearly.",

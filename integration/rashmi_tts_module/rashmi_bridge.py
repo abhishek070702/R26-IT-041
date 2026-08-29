@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import platform
 import re
@@ -6,6 +6,13 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
+
+try:
+    from .simplifier import simplify_text
+    from .pn532_rfid import read_rfid_uid
+except ImportError:
+    from simplifier import simplify_text
+    from pn532_rfid import read_rfid_uid
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,11 +34,50 @@ SAMPLE_RATE = int(os.getenv("RASHMI_SAMPLE_RATE", "16000"))
 _VOSK_MODEL = None
 
 
+def _voice_name(preferences: Optional[Dict] = None) -> str:
+    if not preferences:
+        return "female"
+    voice = str(
+        preferences.get("voice")
+        or preferences.get("voice_type")
+        or "female"
+    ).lower()
+    return "male" if voice == "male" else "female"
+
+
+def _espeak_command(text: str, preferences: Optional[Dict] = None) -> list:
+    speed = "140"
+    pitch = "50"
+    voice = "en+f3"
+
+    if preferences:
+        pace = str(preferences.get("pace", "normal")).lower()
+        if pace == "slow":
+            speed = "115"
+        elif pace == "fast":
+            speed = "170"
+
+        if _voice_name(preferences) == "male":
+            voice = "en+m3"
+            pitch = "35"
+        else:
+            voice = "en+f3"
+            pitch = "72"
+
+        tone = str(preferences.get("tone", "")).lower()
+        if tone == "calm":
+            speed = str(max(int(speed) - 15, 90))
+        elif tone == "friendly":
+            pitch = str(min(int(pitch) + 8, 90))
+
+    return ["espeak-ng", "-v", voice, "-s", speed, "-p", pitch, text]
+
+
 def speak(text: str, preferences: Optional[Dict] = None):
     """
     Rashmi TTS bridge.
     Windows: PowerShell voice for laptop testing.
-    Linux/Raspberry Pi: espeak-ng.
+    Linux/Raspberry Pi: espeak-ng with male/female voice from preferences.
     """
     if not text:
         return
@@ -47,12 +93,19 @@ def speak(text: str, preferences: Optional[Dict] = None):
     try:
         if "windows" in system_name:
             safe_text = text.replace("'", "''")
+            gender = "Female" if _voice_name(preferences) == "female" else "Male"
 
             command = (
                 "Add-Type -AssemblyName System.Speech; "
                 "$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
                 "$speaker.Volume = 100; "
                 "$speaker.Rate = 0; "
+                f"$gender = [System.Speech.Synthesis.VoiceGender]::{gender}; "
+                "foreach ($v in $speaker.GetInstalledVoices()) { "
+                "  if ($v.VoiceInfo.Gender -eq $gender) { "
+                "    $speaker.SelectVoice($v.VoiceInfo.Name); break "
+                "  } "
+                "} "
                 f"$speaker.Speak('{safe_text}');"
             )
 
@@ -71,17 +124,8 @@ def speak(text: str, preferences: Optional[Dict] = None):
             )
 
         else:
-            speed = "140"
-
-            if preferences:
-                pace = str(preferences.get("pace", "normal")).lower()
-                if pace == "slow":
-                    speed = "115"
-                elif pace == "fast":
-                    speed = "170"
-
             subprocess.run(
-                ["espeak-ng", "-s", speed, text],
+                _espeak_command(text, preferences),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -89,6 +133,26 @@ def speak(text: str, preferences: Optional[Dict] = None):
 
     except Exception as error:
         print("TTS error:", error)
+
+
+def speak_reading_text(text: str, preferences: Optional[Dict] = None):
+    """
+    Speak document content using saved reading_level, voice, pace, and tone.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return ""
+
+    level = ""
+    if preferences:
+        level = str(preferences.get("reading_level") or "")
+
+    adapted = simplify_text(text, level)
+    if adapted != text:
+        print("Reading text adapted for level:", level or "simple")
+
+    speak(adapted, preferences)
+    return adapted
 
 
 def init_database():
@@ -132,6 +196,42 @@ def find_user(rfid_id: str):
         return None
 
     return dict(row)
+
+
+def _preferences_from_user(user: Dict) -> Dict:
+    return {
+        "rfid_id": user.get("rfid_id") or "DEFAULT_USER",
+        "reading_level": user.get("reading_level") or "simple",
+        "voice": user.get("voice") or "female",
+        "voice_type": user.get("voice") or user.get("voice_type") or "female",
+        "pace": user.get("pace") or "normal",
+        "tone": user.get("tone") or "friendly",
+    }
+
+
+def find_any_saved_user():
+    saved = load_current_preferences()
+    if isinstance(saved, dict) and saved.get("reading_level"):
+        return _preferences_from_user(saved)
+
+    for user_id in (
+        os.getenv("RASHMI_USER_ID", "DEFAULT_USER"),
+        "CARD0001",
+        "DEFAULT_USER",
+    ):
+        user = find_user(user_id)
+        if user is not None:
+            return _preferences_from_user(user)
+
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    cursor = connection.cursor()
+    cursor.execute("SELECT * FROM user_preferences ORDER BY rowid DESC LIMIT 1")
+    row = cursor.fetchone()
+    connection.close()
+    if row is None:
+        return None
+    return _preferences_from_user(dict(row))
 
 
 def save_user_preferences(
@@ -287,9 +387,21 @@ def _match_answer(answer_text: str, valid_answers: List[str]):
     aliases = {
         "summary": ["summary", "summery", "summarize", "short", "brief"],
         "full": ["full", "all", "read it", "read full", "full text", "whole", "complete"],
+        "next": [
+            "next",
+            "nest",
+            "necks",
+            "go",
+            "continue",
+            "proceed",
+            "start",
+            "ready",
+            "really",
+        ],
+        "stop": ["stop", "end", "finish", "quit"],
         "yes": ["yes", "yeah", "yep", "ok", "okay"],
         "no": ["no", "nope"],
-        "ready": ["ready", "done", "finished", "ok", "okay"],
+        "ready": ["ready", "done", "finished"],
         "simple": ["simple", "easy"],
         "moderate": ["moderate", "medium", "normal level"],
         "advanced": ["advanced", "advance", "hard"],
@@ -411,9 +523,9 @@ def ask_summary_or_full(preferences: Optional[Dict] = None):
 
 def ask_ready_for_next_page(preferences: Optional[Dict] = None):
     return ask_by_voice(
-        question="Please turn to the next page. Say ready when done.",
-        valid_answers=["ready"],
-        default_answer="ready",
+        question="Please turn to the next page. Say next when done.",
+        valid_answers=["next"],
+        default_answer="next",
         preferences=preferences,
         attempts=3,
         max_seconds=8,
@@ -480,32 +592,27 @@ def ask_new_preferences(rfid_id: str):
 def get_user_preferences():
     """
     RFID + preference flow.
-    RFID is still keyboard/scanner input.
-    After RFID, preferences are collected by Rashmi voice input.
+    Wait for a PN532 card tap on the Pi. Keyboard entry is only a fallback.
+    After the card id, preferences are collected by Rashmi voice input.
     """
     init_database()
 
     speak("Hello. Welcome to the Smart Reading Assistant System.")
-    speak("Please tap your RFID card.")
+    speak("Please tap your RFID card on the reader.")
 
-    rfid_id = input("Enter RFID card ID: ").strip()
+    rfid_id = read_rfid_uid().strip()
 
     if not rfid_id:
         rfid_id = "TEST_RFID_001"
+
+    print("RFID card ID:", rfid_id)
 
     user = find_user(rfid_id)
 
     if user is None:
         return ask_new_preferences(rfid_id)
 
-    preferences = {
-        "rfid_id": user["rfid_id"],
-        "reading_level": user["reading_level"],
-        "voice": user["voice"],
-        "voice_type": user["voice"],
-        "pace": user["pace"],
-        "tone": user["tone"],
-    }
+    preferences = _preferences_from_user(user)
 
     speak("Known RFID card detected.", preferences)
 
@@ -550,7 +657,7 @@ def format_abhishek_result_for_speech(result: Dict):
 
 def speak_abhishek_result(result: Dict, preferences: Optional[Dict] = None):
     speech_text = format_abhishek_result_for_speech(result)
-    speak(speech_text, preferences)
+    speak_reading_text(speech_text, preferences)
     return speech_text
 
 
@@ -595,7 +702,7 @@ def speak_harshaka_result(result: Dict, preferences: Optional[Dict] = None):
     if not speech_text:
         speech_text = "No readable content was found."
 
-    speak(speech_text, preferences)
+    speak_reading_text(speech_text, preferences)
     return speech_text
 
 

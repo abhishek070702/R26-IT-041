@@ -60,3 +60,4 @@ integration/manoj_camera_module/latest_captured_image.txt
 integration/rashmi_tts_module/users.db
 
 integration/rashmi_tts_module/current_preferences.json
+integration/rashmi_tts_module/tts_outputs/

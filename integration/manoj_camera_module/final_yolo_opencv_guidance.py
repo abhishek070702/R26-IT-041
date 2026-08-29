@@ -20,6 +20,18 @@ from ultralytics import YOLO
 # ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent.parent if BASE_DIR.parent.name == "integration" else BASE_DIR.parent
+INTEGRATION_DIR = PROJECT_ROOT / "integration"
+if str(INTEGRATION_DIR) not in sys.path:
+    sys.path.insert(0, str(INTEGRATION_DIR))
+
+try:
+    from rashmi_tts_module.preference_tts import (
+        preferences_from_env,
+        speak_preference_voice,
+    )
+except Exception:
+    speak_preference_voice = None
+    preferences_from_env = None
 
 
 def resolve_model_path() -> Path:
@@ -149,31 +161,12 @@ class VoiceSystem:
         )
         self.worker_thread.start()
 
-    def _speak_windows(self, text):
-        safe_text = text.replace("'", "''")
+    def _speak_text(self, text):
+        if speak_preference_voice is not None:
+            prefs = preferences_from_env() if preferences_from_env else None
+            speak_preference_voice(text, prefs)
+            return
 
-        command = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$speaker.Rate = 0; "
-            "$speaker.Volume = 100; "
-            f"$speaker.Speak('{safe_text}');"
-        )
-
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-    def _speak_linux(self, text):
         voice = os.getenv("RASHMI_VOICE", "female").strip().lower()
         pace = os.getenv("RASHMI_PACE", "normal").strip().lower()
         espeak_voice = "en+m3" if voice == "male" else "en+f3"
@@ -183,7 +176,6 @@ class VoiceSystem:
             speed = "115"
         elif pace == "fast":
             speed = "170"
-
         subprocess.run(
             ["espeak-ng", "-v", espeak_voice, "-s", speed, "-p", pitch, str(text)],
             stdout=subprocess.DEVNULL,
@@ -218,10 +210,7 @@ class VoiceSystem:
             with self._lock:
                 self._speaking = True
             try:
-                if "windows" in platform.system().lower():
-                    self._speak_windows(text)
-                else:
-                    self._speak_linux(text)
+                self._speak_text(text)
             except Exception as error:
                 print("Voice error:", error)
             finally:

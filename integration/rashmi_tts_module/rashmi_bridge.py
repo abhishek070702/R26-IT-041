@@ -10,9 +10,11 @@ from typing import Dict, List, Optional
 try:
     from .simplifier import simplify_text
     from .pn532_rfid import read_rfid_uid
+    from .preference_tts import speak_preference_voice
 except ImportError:
     from simplifier import simplify_text
     from pn532_rfid import read_rfid_uid
+    from preference_tts import speak_preference_voice
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,39 +47,10 @@ def _voice_name(preferences: Optional[Dict] = None) -> str:
     return "male" if voice == "male" else "female"
 
 
-def _espeak_command(text: str, preferences: Optional[Dict] = None) -> list:
-    speed = "140"
-    pitch = "50"
-    voice = "en+f3"
-
-    if preferences:
-        pace = str(preferences.get("pace", "normal")).lower()
-        if pace == "slow":
-            speed = "115"
-        elif pace == "fast":
-            speed = "170"
-
-        if _voice_name(preferences) == "male":
-            voice = "en+m3"
-            pitch = "35"
-        else:
-            voice = "en+f3"
-            pitch = "72"
-
-        tone = str(preferences.get("tone", "")).lower()
-        if tone == "calm":
-            speed = str(max(int(speed) - 15, 90))
-        elif tone == "friendly":
-            pitch = str(min(int(pitch) + 8, 90))
-
-    return ["espeak-ng", "-v", voice, "-s", speed, "-p", pitch, text]
-
-
 def speak(text: str, preferences: Optional[Dict] = None):
     """
-    Rashmi TTS bridge.
-    Windows: PowerShell voice for laptop testing.
-    Linux/Raspberry Pi: espeak-ng with male/female voice from preferences.
+    Rashmi TTS from Final 1.1.ipynb: Edge neural voice + pace + tone.
+    Offline fallback is espeak-ng / Windows Speech.
     """
     if not text:
         return
@@ -87,50 +60,8 @@ def speak(text: str, preferences: Optional[Dict] = None):
         return
 
     print("TTS:", text)
-
-    system_name = platform.system().lower()
-
     try:
-        if "windows" in system_name:
-            safe_text = text.replace("'", "''")
-            gender = "Female" if _voice_name(preferences) == "female" else "Male"
-
-            command = (
-                "Add-Type -AssemblyName System.Speech; "
-                "$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                "$speaker.Volume = 100; "
-                "$speaker.Rate = 0; "
-                f"$gender = [System.Speech.Synthesis.VoiceGender]::{gender}; "
-                "foreach ($v in $speaker.GetInstalledVoices()) { "
-                "  if ($v.VoiceInfo.Gender -eq $gender) { "
-                "    $speaker.SelectVoice($v.VoiceInfo.Name); break "
-                "  } "
-                "} "
-                f"$speaker.Speak('{safe_text}');"
-            )
-
-            subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-
-        else:
-            subprocess.run(
-                _espeak_command(text, preferences),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-
+        speak_preference_voice(text, preferences)
     except Exception as error:
         print("TTS error:", error)
 

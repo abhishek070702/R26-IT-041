@@ -27,10 +27,12 @@ if str(INTEGRATION_DIR) not in sys.path:
 try:
     from rashmi_tts_module.preference_tts import (
         preferences_from_env,
-        speak_preference_voice,
+        _speak_espeak_or_windows,
+        _speak_via_tts_server,
     )
 except Exception:
-    speak_preference_voice = None
+    _speak_espeak_or_windows = None
+    _speak_via_tts_server = None
     preferences_from_env = None
 
 
@@ -63,11 +65,12 @@ CAPTURE_DIR.mkdir(exist_ok=True)
 # CAMERA SETTINGS
 # USB webcam on Raspberry Pi: CAMERA_INDEX=0 or 1
 # Do not import picamera2 (that is Pi Camera Module 3 only).
+# Pi defaults stay small so YOLO does not freeze after open.
 # ==========================================================
 _IS_LINUX = platform.system().lower() != "windows"
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
-FRAME_WIDTH = int(os.getenv("CAMERA_WIDTH", "1280"))
-FRAME_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "720"))
+FRAME_WIDTH = int(os.getenv("CAMERA_WIDTH", "640" if _IS_LINUX else "1280"))
+FRAME_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480" if _IS_LINUX else "720"))
 CAMERA_FPS = int(os.getenv("CAMERA_FPS", "15" if _IS_LINUX else "30"))
 CAMERA_FLIP = os.getenv(
     "CAMERA_FLIP",
@@ -150,9 +153,12 @@ class VoiceSystem:
     The camera loop never talks on the main thread, so guidance cannot overlap.
     """
 
+    _playback_lock = threading.Lock()
+
     def __init__(self):
         self.voice_queue = queue.Queue()
         self._speaking = False
+        self._pending = 0
         self._lock = threading.Lock()
         self.last_text = ""
         self.worker_thread = threading.Thread(
@@ -162,48 +168,64 @@ class VoiceSystem:
         self.worker_thread.start()
 
     def _speak_text(self, text):
-        if speak_preference_voice is not None:
-            prefs = preferences_from_env() if preferences_from_env else None
-            speak_preference_voice(text, prefs)
-            return
+        # Laptop TTS server first. Never call OpenAI from the camera loop.
+        prefs = preferences_from_env() if preferences_from_env else None
 
-        voice = os.getenv("RASHMI_VOICE", "female").strip().lower()
-        pace = os.getenv("RASHMI_PACE", "normal").strip().lower()
-        espeak_voice = "en+m3" if voice == "male" else "en+f3"
-        pitch = "35" if voice == "male" else "72"
-        speed = "140"
-        if pace == "slow":
-            speed = "115"
-        elif pace == "fast":
-            speed = "170"
-        subprocess.run(
-            ["espeak-ng", "-v", espeak_voice, "-s", speed, "-p", pitch, str(text)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        with VoiceSystem._playback_lock:
+            spoken = False
+            if _speak_via_tts_server is not None:
+                spoken = bool(_speak_via_tts_server(text, prefs))
+            if not spoken and _speak_espeak_or_windows is not None:
+                try:
+                    _speak_espeak_or_windows(text, prefs)
+                    spoken = True
+                except Exception as error:
+                    print("Local camera voice failed:", error)
+            if not spoken:
+                voice = os.getenv("RASHMI_VOICE", "female").strip().lower()
+                pace = os.getenv("RASHMI_PACE", "normal").strip().lower()
+                espeak_voice = "en+m3" if voice == "male" else "en+f3"
+                pitch = "35" if voice == "male" else "72"
+                speed = "140"
+                if pace == "slow":
+                    speed = "115"
+                elif pace == "fast":
+                    speed = "170"
+                binary = "espeak-ng"
+                subprocess.run(
+                    [binary, "-v", espeak_voice, "-s", speed, "-p", pitch, str(text)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            # Speaker buffers can keep playing after the process exits.
+            # Wait so the next cue cannot cut off the last words.
+            pause = 0.35 + (0.06 * max(1, len(str(text).split())))
+            time.sleep(min(pause, 1.2))
 
     def is_busy(self):
         with self._lock:
-            speaking = self._speaking
-        return speaking or not self.voice_queue.empty()
+            return self._speaking or self._pending > 0 or not self.voice_queue.empty()
 
     def say(self, text, force=False):
         text = str(text or "").strip()
         if not text:
             return
+
         # force=True queues behind the current line. It never speaks in parallel.
-        if not force and self.is_busy():
-            return
+        with self._lock:
+            busy = self._speaking or self._pending > 0 or not self.voice_queue.empty()
+            if not force and busy:
+                return
+            self._pending += 1
+            self.last_text = text
 
         print("VOICE:", text)
-        self.last_text = text
         self.voice_queue.put(text)
 
     def _worker(self):
         while True:
             text = self.voice_queue.get()
-
             if text is None:
                 break
 
@@ -216,6 +238,7 @@ class VoiceSystem:
             finally:
                 with self._lock:
                     self._speaking = False
+                    self._pending = max(0, self._pending - 1)
 
 
 # ==========================================================
@@ -353,7 +376,6 @@ def _pick_best_page_box(result, frame_width, frame_height, model_names):
                 continue
 
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-
         x1 = max(0, min(x1, frame_width - 1))
         y1 = max(0, min(y1, frame_height - 1))
         x2 = max(0, min(x2, frame_width - 1))
@@ -507,13 +529,10 @@ def decide_guidance(detection, metrics, config):
 
     if offset_x < -center_tolerance_x:
         return "Move left to center the page", False
-
     if offset_x > center_tolerance_x:
         return "Move right to center the page", False
-
     if offset_y < -center_tolerance_y:
         return "Move up to center the page", False
-
     if offset_y > center_tolerance_y:
         return "Move down to center the page", False
 
@@ -619,6 +638,7 @@ def send_to_next_module(image_path):
             ],
             cwd=str(BASE_DIR),
             check=False,
+            timeout=200,
         )
     except Exception as error:
         print("Error sending image to next module:", error)
@@ -752,6 +772,17 @@ def draw_ui(frame, detection, metrics, instruction, ready_count, config, ready_h
     return frame
 
 
+def preview_enabled() -> bool:
+    flag = os.getenv("CAMERA_PREVIEW", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if _IS_LINUX:
+        return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+    return True
+
+
 # ==========================================================
 # MAIN FUNCTION
 # ==========================================================
@@ -777,6 +808,9 @@ def main():
     print(f"YOLO model loaded in {time.perf_counter() - t_load:.1f}s")
 
     print("Model classes:", model_names)
+    dummy = np.zeros((YOLO_IMAGE_SIZE, YOLO_IMAGE_SIZE, 3), dtype=np.uint8)
+    model.predict(dummy, imgsz=YOLO_IMAGE_SIZE, verbose=False)
+    print("YOLO warmup done.")
 
     print("Opening camera index:", CAMERA_INDEX)
     cap = open_camera(CAMERA_INDEX)
@@ -787,6 +821,9 @@ def main():
         print("Run: ls /dev/video*")
         print("Then: export CAMERA_INDEX=0   or   export CAMERA_INDEX=1")
         return
+
+    show_preview = preview_enabled()
+    print("Camera opened. Guidance loop starting. Preview:", show_preview)
 
     voice = VoiceSystem()
     voice.say(
@@ -921,8 +958,7 @@ def main():
             is_ready and
             ready_since is not None and
             hold_seconds >= READY_HOLD_SECONDS and
-            cooldown_ok and
-            not voice.is_busy()
+            cooldown_ok
         ):
             voice.say("Capturing now.", force=True)
 
@@ -945,32 +981,34 @@ def main():
                 print("Single capture done. Closing camera.")
                 break
 
-        display_frame = draw_ui(
-            frame,
-            detection,
-            metrics,
-            instruction,
-            ready_count,
-            config,
-            ready_hold_seconds=hold_seconds,
-        )
-
-        if display_frame.shape[1] > PREVIEW_MAX_WIDTH:
-            scale = PREVIEW_MAX_WIDTH / float(display_frame.shape[1])
-            display_frame = cv2.resize(
-                display_frame,
-                (
-                    PREVIEW_MAX_WIDTH,
-                    max(1, int(display_frame.shape[0] * scale)),
-                ),
+        if show_preview:
+            display_frame = draw_ui(
+                frame,
+                detection,
+                metrics,
+                instruction,
+                ready_count,
+                config,
+                ready_hold_seconds=hold_seconds,
             )
 
-        cv2.imshow(
-            "YOLO Page Guidance + Auto Capture",
-            display_frame
-        )
+            if display_frame.shape[1] > PREVIEW_MAX_WIDTH:
+                scale = PREVIEW_MAX_WIDTH / float(display_frame.shape[1])
+                display_frame = cv2.resize(
+                    display_frame,
+                    (
+                        PREVIEW_MAX_WIDTH,
+                        max(1, int(display_frame.shape[0] * scale)),
+                    ),
+                )
 
-        key = cv2.waitKey(1) & 0xFF
+            cv2.imshow(
+                "YOLO Page Guidance + Auto Capture",
+                display_frame
+            )
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = 0
 
         if key == ord("q"):
             break
@@ -987,7 +1025,8 @@ def main():
                 voice.say("No page detected")
 
     cap.release()
-    cv2.destroyAllWindows()
+    if show_preview:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -65,15 +65,10 @@ async def describe_uploaded_image(
     context: str = Form("general"),
 ):
     """
-    Image-description-only endpoint for reusable Florence captions.
+    Image-description-only endpoint for page illustrations.
 
-    Intended for:
-      - novel_cover
-      - novel_page illustrations
-      - magazine_page
-      - newspaper_article_image (cropped article photo from Harshaka)
-      - newspaper_page
-      - general
+    Florence runs first. OpenAI Vision is used only when enabled and the
+    local caption is missing, weak, or about the real-world background.
     """
     original_name = file.filename or "selected_image.jpg"
     ext = os.path.splitext(original_name)[1] or ".jpg"

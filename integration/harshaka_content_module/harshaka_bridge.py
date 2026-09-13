@@ -88,6 +88,12 @@ def get_available_categories(analysis_result: Dict[str, Any]) -> List[str]:
             unique_categories.append(normalized)
             seen.add(key)
 
+    document_type = str(analysis_result.get("document_type") or "").lower()
+    if "news" in document_type:
+        unique_categories = [
+            item for item in unique_categories if item.strip().lower() != "story"
+        ]
+
     return unique_categories
 
 

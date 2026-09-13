@@ -109,11 +109,13 @@ except Exception:
 try:
     from backend.image_description.openai_fallback import (
         is_openai_fallback_enabled as _is_openai_fallback_enabled,
+        run_openai_page_illustration_fallback as _run_openai_page_illustration_fallback,
         run_openai_vision_fallback as _run_openai_vision_fallback,
     )
 except Exception:
     _is_openai_fallback_enabled = None
     _run_openai_vision_fallback = None
+    _run_openai_page_illustration_fallback = None
 
 
 # Abhishek title_reader runs for these types.
@@ -159,6 +161,9 @@ WEAK_CAPTION_PHRASES = (
     "a picture",
 )
 
+ANALYZE_TIME_BUDGET_SEC = float(os.getenv("ANALYZE_TIME_BUDGET_SEC", "70"))
+OPENAI_FALLBACK_TIMEOUT_SEC = float(os.getenv("OPENAI_FALLBACK_TIMEOUT_SEC", "15"))
+
 WEAK_IMAGE_DESCRIPTION_PHRASES = (
     "related to the story",
     "visual design",
@@ -170,6 +175,19 @@ WEAK_IMAGE_DESCRIPTION_PHRASES = (
     "cover contains an illustration or visual design",
     "no clear main image is detected",
     "no important visual image is detected",
+    "person holding",
+    "holding a book",
+    "in their hand",
+    "in his hand",
+    "in her hand",
+    "on a table",
+    "on the table",
+    "next to a bottle",
+    "near a bottle",
+    "in the background",
+    "in the room",
+    "against a wall",
+    "against the wall",
 )
 
 
@@ -1094,6 +1112,29 @@ def _is_weak_image_description(text: str) -> bool:
     return False
 
 
+def _is_camera_background_description(text: str) -> bool:
+    """True when the caption describes the real-world scene, not the page."""
+    normalized = _normalize_compare_text(text)
+    if not normalized:
+        return False
+    markers = (
+        "a person holding a book in their hand",
+        "holding a book in their hand",
+        "in their hand",
+        "in his hand",
+        "in her hand",
+        "on a table",
+        "on the table",
+        "next to a bottle",
+        "near a bottle",
+        "in the background",
+        "in the room",
+        "against a wall",
+        "against the wall",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def _local_image_descriptions_are_weak(image_descriptions: list[str]) -> bool:
     if not image_descriptions:
         return True
@@ -1114,8 +1155,13 @@ def _should_trigger_openai_fallback(
     title: str,
     image_descriptions: list[str],
     status: str,
+    document_type: str = "",
 ) -> tuple[bool, str]:
+    if str(document_type or "").strip() == "Newspaper":
+        return True, "newspaper_masthead_title"
     reasons: list[str] = []
+    if str(document_type or "").strip() in {"Novel", "Magazine"}:
+        reasons.append("cover_visual")
     if _local_image_descriptions_are_weak(image_descriptions):
         reasons.append("weak_image_description")
     if title == TITLE_NOT_CLEAR:
@@ -1133,6 +1179,8 @@ def _apply_openai_fallback(
     image_descriptions: list[str],
     warnings: list[str],
     status: str,
+    document_type: str = "",
+    timeout_sec: float = OPENAI_FALLBACK_TIMEOUT_SEC,
 ) -> tuple[str, list[str], list[str]]:
     """
     Optional OpenAI Vision fallback. Local PP2 results are kept unless
@@ -1162,8 +1210,15 @@ def _apply_openai_fallback(
         logger.info("OpenAI fallback skipped reason=disabled")
         return title, image_descriptions, warnings
 
+    if timeout_sec < 3:
+        print("[pipeline] OpenAI fallback used=false")
+        print(f"[pipeline] final image description={local_desc_log!r}")
+        print("[pipeline] OpenAI fallback skipped (no time budget)")
+        logger.info("OpenAI fallback skipped reason=no_time_budget")
+        return title, image_descriptions, warnings
+
     should_run, reason = _should_trigger_openai_fallback(
-        title, image_descriptions, status
+        title, image_descriptions, status, document_type=document_type
     )
     if not should_run:
         print("[pipeline] OpenAI fallback used=false")
@@ -1183,7 +1238,10 @@ def _apply_openai_fallback(
         return title, image_descriptions, warnings
 
     try:
-        fallback = _run_openai_vision_fallback(image_path)
+        fallback = _run_openai_vision_fallback(
+            image_path,
+            document_type=document_type,
+        )
     except Exception:
         logger.exception("OpenAI fallback crashed; keeping local result")
         print("[pipeline] OpenAI fallback used=false")
@@ -1204,15 +1262,29 @@ def _apply_openai_fallback(
     new_title = title
     new_descriptions = list(image_descriptions or [])
     new_warnings = list(warnings or [])
+    is_newspaper = str(document_type or "").strip() == "Newspaper"
 
-    if title == TITLE_NOT_CLEAR and openai_title:
+    if is_newspaper:
+        new_descriptions = []
+        if openai_title:
+            new_title = openai_title
+            new_warnings = [w for w in new_warnings if w != TITLE_CONFIDENCE_WARNING]
+            merged = True
+            print(f"[pipeline] OpenAI newspaper masthead title={new_title!r}")
+    elif title == TITLE_NOT_CLEAR and openai_title:
         new_title = openai_title
         new_warnings = [w for w in new_warnings if w != TITLE_CONFIDENCE_WARNING]
         merged = True
         print(f"[pipeline] OpenAI fallback title merged: {new_title!r}")
 
     local_desc_unusable = _local_image_descriptions_are_weak(new_descriptions)
-    if local_desc_unusable and openai_description:
+    prefer_openai_cover = str(document_type or "").strip() in {"Novel", "Magazine"}
+    if (
+        not is_newspaper
+        and openai_description
+        and not _is_camera_background_description(openai_description)
+        and (local_desc_unusable or prefer_openai_cover)
+    ):
         new_descriptions = [openai_description]
         new_warnings = [w for w in new_warnings if w != "Image description failed"]
         merged = True
@@ -1298,13 +1370,30 @@ def analyze_page(image_path: str) -> dict:
 
         print(f"[pipeline] crop path used for BLIP: {cropped_image_path}")
         t0 = time.perf_counter()
-        raw_image_descriptions, image_warnings, description_source, florence_meta = (
-            _describe_images_local(
-                cropped_image_path,
-                title=title,
-                document_type=document_type,
+        remaining = ANALYZE_TIME_BUDGET_SEC - (time.perf_counter() - t_total)
+        skip_visual = document_type == "Newspaper" or remaining < 12
+        if skip_visual:
+            reason = (
+                "newspaper_masthead_only"
+                if document_type == "Newspaper"
+                else "analyze_time_budget"
             )
-        )
+            print(f"[pipeline] skipping cover description ({reason})")
+            logger.info("skip cover description reason=%s", reason)
+            raw_image_descriptions, image_warnings, description_source, florence_meta = (
+                [],
+                [],
+                "skipped",
+                {},
+            )
+        else:
+            raw_image_descriptions, image_warnings, description_source, florence_meta = (
+                _describe_images_local(
+                    cropped_image_path,
+                    title=title,
+                    document_type=document_type,
+                )
+            )
         blip_sec = time.perf_counter() - t0
         all_warnings.extend(image_warnings)
         print(
@@ -1389,6 +1478,10 @@ def analyze_page(image_path: str) -> dict:
                 florence_cleaned_caption,
                 document_type,
             )
+        elif description_source == "skipped":
+            image_descriptions = []
+            print("[pipeline] final description source=skipped")
+            logger.info("final description source=skipped document_type=%s", document_type)
         else:
             # Recover title from raw BLIP text before formatting the description.
             title, all_warnings = _recover_title_from_blip_captions(
@@ -1415,12 +1508,18 @@ def analyze_page(image_path: str) -> dict:
                 unique_warnings.append(warning)
 
         local_status = _resolve_status(unique_warnings, document_type)
+        fallback_budget = min(
+            OPENAI_FALLBACK_TIMEOUT_SEC,
+            max(0.0, ANALYZE_TIME_BUDGET_SEC - (time.perf_counter() - t_total) - 3.0),
+        )
         title, image_descriptions, unique_warnings = _apply_openai_fallback(
             cropped_image_path,
             title,
             image_descriptions,
             unique_warnings,
             local_status,
+            document_type=document_type,
+            timeout_sec=fallback_budget,
         )
 
         seen = set()
@@ -1472,8 +1571,10 @@ def analyze_page(image_path: str) -> dict:
 
 def describe_image_only(image_path: str, context: str = "general") -> dict:
     """
-    Reusable Florence-only image description for cropped covers / page
-    illustrations / selected newspaper article images.
+    Reusable image description for page illustrations / article photos.
+
+    Local Florence still runs as backup. When USE_OPENAI_FALLBACK=true, OpenAI
+    Vision is given the page-illustration task and its caption is preferred.
 
     Does not run document classification or title reading.
     """
@@ -1585,23 +1686,91 @@ def describe_image_only(image_path: str, context: str = "general") -> dict:
     if any(marker in lowered for marker in no_image_markers):
         has_image = False
 
-    if not description and not raw:
+    local_is_weak = (
+        (not has_image)
+        or _is_weak_image_description(description)
+        or _is_camera_background_description(description)
+    )
+    print(f"[image_description] local has_image={str(has_image).lower()}")
+    print(f"[image_description] local description={description!r}")
+    print(f"[image_description] local is weak={str(local_is_weak).lower()}")
+
+    openai_used = False
+    openai_answered = False
+    if _openai_fallback_flag():
+        if _run_openai_page_illustration_fallback is None:
+            print("[image_description] OpenAI fallback skipped (module missing)")
+        else:
+            print("[image_description] OpenAI page-illustration task")
+            try:
+                fallback = _run_openai_page_illustration_fallback(
+                    process_path,
+                    context=normalized_context,
+                )
+            except Exception:
+                logger.exception("OpenAI page-illustration fallback crashed")
+                fallback = None
+
+            if fallback and isinstance(fallback, dict):
+                openai_answered = True
+                openai_has_image = bool(fallback.get("has_image"))
+                openai_description = str(
+                    fallback.get("image_description") or ""
+                ).strip()
+                if openai_has_image and openai_description:
+                    if not _is_camera_background_description(openai_description):
+                        has_image = True
+                        description = openai_description
+                        openai_used = True
+                        if OPENAI_FALLBACK_WARNING not in warnings:
+                            warnings.append(OPENAI_FALLBACK_WARNING)
+                    else:
+                        has_image = False
+                        description = ""
+                else:
+                    has_image = False
+                    description = ""
+                print(
+                    "[image_description] OpenAI fallback used="
+                    f"{str(openai_used).lower()} has_image="
+                    f"{str(has_image).lower()}"
+                )
+            else:
+                print("[image_description] OpenAI failed; keeping local result")
+    else:
+        print("[image_description] OpenAI skipped (disabled); using Florence")
+
+    if openai_used:
+        if not description or _is_camera_background_description(description):
+            has_image = False
+            description = ""
+    elif has_image and (
+        not description
+        or _is_weak_image_description(description)
+        or _is_camera_background_description(description)
+    ):
+        has_image = False
+        description = ""
+
+    if not has_image:
+        description = ""
+
+    if has_image and description:
+        status = "success"
+    elif not raw and not openai_answered:
         warnings.append("Image description failed")
         status = "failed"
-    elif not has_image:
-        status = "partial_success" if description else "failed"
-        if not description:
-            warnings.append("Image description failed")
     else:
         status = "success"
 
     print(f"[image_description] has_image={str(has_image).lower()}")
     print(f"[image_description] final_description={description!r}")
     logger.info(
-        "describe_image_only has_image=%s status=%s description=%r",
+        "describe_image_only has_image=%s status=%s description=%r openai_used=%s",
         has_image,
         status,
         description,
+        openai_used,
     )
 
     # Deduplicate warnings

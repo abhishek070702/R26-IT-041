@@ -17,9 +17,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Load .env before pipeline import (pipeline reads OPENAI_API_KEY, paths at import time).
-load_dotenv()
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+for _env_path in (
+    _HERE / ".env",
+    _ROOT / ".env",
+    _ROOT / "backend" / ".env",
+):
+    if _env_path.is_file():
+        load_dotenv(_env_path, override=True)
+        print("Harshaka loaded env from:", _env_path)
 
-from pipeline import analyze_content, generate_selected_output
+from pipeline import CONFIG, analyze_content, generate_selected_output
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,7 +62,16 @@ class GenerateOutputRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    return {
+        "status": "ok",
+        "service": "harshaka",
+        "openai_key_present": bool(key),
+        "openai_model": getattr(CONFIG, "openai_model", ""),
+        "prefer_openai_articles": bool(
+            getattr(CONFIG, "prefer_openai_article_detection_first", False)
+        ),
+    }
 
 
 @app.post("/analyze")
@@ -117,6 +135,8 @@ async def analyze(
     fallback = analysis.get("fallback") if isinstance(analysis.get("fallback"), dict) else {}
 
     return {
+        "status": "success",
+        "document_type": analysis.get("document_type") or (document_type or ""),
         "extracted_text": extracted,
         "local_extracted_text": analysis.get("local_extracted_text") or extracted,
         "ai_extracted_text": analysis.get("ai_extracted_text") or "",
@@ -128,6 +148,7 @@ async def analyze(
         "article_fallback_used": bool(fallback.get("article_fallback_used")),
         "local_quality": fallback.get("local_quality") or {},
         "pipeline_version": analysis.get("pipeline_version"),
+        "openai_used": bool((analysis.get("processing") or {}).get("openai_used")),
         "analysis": analysis,
     }
 
@@ -150,9 +171,14 @@ def generate_output(body: GenerateOutputRequest):
     payload = out.get("next_module_payload") or {}
     next_text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
 
+    spoken = (out.get("final_output_text") or next_text or "").strip()
     return {
-        "final_output_text": out.get("final_output_text", ""),
+        "status": "success",
+        "text": spoken,
+        "final_output_text": spoken,
         "next_module_payload": next_text,
+        "selected_category": body.selected_category,
+        "content_depth": body.depth,
     }
 
 

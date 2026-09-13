@@ -236,6 +236,26 @@ def is_multi_category_document(document_type: Any) -> bool:
     return normalize_document_type(document_type) in MULTI_CATEGORY_TYPES
 
 
+def sanitize_newspaper_category(
+    category: Any,
+    top_predictions: Any = None,
+) -> str:
+    """Newspaper articles must not be classified as Story."""
+    name = str(category or "").strip()
+    if name.lower() != "story":
+        return name if name in PROJECT_CATEGORIES else "General Text"
+
+    if isinstance(top_predictions, list):
+        for item in top_predictions:
+            if isinstance(item, dict):
+                candidate = str(item.get("category") or "").strip()
+            else:
+                candidate = str(item or "").strip()
+            if candidate and candidate.lower() != "story" and candidate in PROJECT_CATEGORIES:
+                return candidate
+    return "General Text"
+
+
 # ============================================================
 # 3. TEXT HELPERS
 # ============================================================
@@ -6673,6 +6693,12 @@ def predict_category(
     ):
         category = "General Text"
         decision = "textbook_type_gate"
+
+    if normalized_type == "Newspaper":
+        before = str(category or "").strip()
+        category = sanitize_newspaper_category(category, top_predictions)
+        if before.lower() == "story":
+            decision = "newspaper_story_blocked"
 
     return {
         "category": (
@@ -20620,7 +20646,7 @@ class ApplicationFallbackConfig(AdaptiveReadingGraphConfig):
     openai_model: str = field(
         default_factory=lambda: os.getenv(
             "OPENAI_FALLBACK_MODEL",
-            "gpt-5-mini",
+            os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         )
     )
 
@@ -20692,10 +20718,19 @@ class ApplicationFallbackConfig(AdaptiveReadingGraphConfig):
 # 25.1 OPENAI CLIENT — LAZY, ENVIRONMENT KEY ONLY
 # ---------------------------------------------------------------------
 
+_OPENAI_KEY_REJECTED = False
+
 
 def openai_fallback_available_v7(
     config: ApplicationFallbackConfig,
 ) -> tuple[bool, str]:
+    global _OPENAI_KEY_REJECTED
+    if _OPENAI_KEY_REJECTED:
+        return (
+            False,
+            "OPENAI_API_KEY was rejected (401)",
+        )
+
     if config.research_mode:
         return (
             False,
@@ -20799,19 +20834,27 @@ def openai_structured_response_v7(
     schema: dict[str, Any],
     max_output_tokens: int,
 ) -> dict[str, Any]:
-    response = client.responses.create(
-        model=model,
-        input=input_items,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "strict": True,
-                "schema": schema,
-            }
-        },
-        max_output_tokens=max_output_tokens,
-    )
+    global _OPENAI_KEY_REJECTED
+    try:
+        response = client.responses.create(
+            model=model,
+            input=input_items,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            max_output_tokens=max_output_tokens,
+        )
+    except Exception as error:
+        message = str(error)
+        if "401" in message or "invalid_api_key" in message.lower():
+            _OPENAI_KEY_REJECTED = True
+            print("Harshaka OpenAI key was rejected (401). Using local OCR only.")
+        raise
 
     raw = response.output_text
 
@@ -21366,6 +21409,7 @@ def openai_category_v7(
     title: str,
     text: str,
     config: ApplicationFallbackConfig,
+    document_type: str = "",
 ) -> str:
     client = get_openai_client_v7(
         config
@@ -21374,6 +21418,8 @@ def openai_category_v7(
     allowed = list(
         config.fallback_categories
     )
+    if normalize_document_type(document_type) == "Newspaper":
+        allowed = [item for item in allowed if str(item).strip().lower() != "story"]
 
     schema = {
         "type": "object",
@@ -21396,6 +21442,15 @@ def openai_category_v7(
         ]
     )
 
+    story_guidance = ""
+    if "Story" in allowed:
+        story_guidance = "- Story: novels, fiction, narrative stories.\n"
+    extra_rule = (
+        "Do not use Story. Do not create a new category."
+        if "Story" not in allowed
+        else "Do not create a new category."
+    )
+
     prompt = f"""
 Choose exactly ONE category for this reading content.
 
@@ -21409,10 +21464,9 @@ Guidance:
 - Social: community, labour, society, rights, social issues.
 - Science: science, medicine, environment, scientific/technical topics.
 - Mathematics: mathematical teaching/calculation/formulas.
-- Story: novels, fiction, narrative stories.
-- General Text: content that does not reliably fit another allowed class.
+{story_guidance}- General Text: content that does not reliably fit another allowed class.
 
-Do not create a new category.
+{extra_rule}
 
 Title:
 {title}
@@ -21531,7 +21585,13 @@ def maybe_apply_category_fallback_v7(
                 ),
             ),
             config=config,
+            document_type=document_type,
         )
+        if normalize_document_type(document_type) == "Newspaper":
+            category = sanitize_newspaper_category(
+                category,
+                local_prediction.get("top_predictions"),
+            )
 
         return {
             **local_prediction,

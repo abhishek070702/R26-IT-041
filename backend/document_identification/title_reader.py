@@ -1664,11 +1664,15 @@ def _ocr_newspaper_masthead_region(image_path):
     masthead_crop = image.crop((0, 0, page_width, crop_height))
     crop_np = np.array(masthead_crop)
 
-    raw_results = reader.readtext(
-        crop_np,
-        detail=1,
-        paragraph=False,
-    )
+    try:
+        raw_results = _easyocr_readtext_with_timeout(
+            crop_np,
+            min(TITLE_OCR_TIME_BUDGET_SEC, 20.0),
+        )
+    except TimeoutError:
+        print("[title_reader] newspaper masthead OCR timed out")
+        logger.warning("newspaper masthead OCR timed out")
+        return [], page_width, page_height
 
     lines = []
     for bbox, text, conf in raw_results:

@@ -261,12 +261,13 @@ def describe_page_visual(
     image_path: Path,
     context: str,
     preferences: Dict,
-):
+) -> bool:
     """
-    Call Abhishek /abhishek/describe-image and speak only a meaningful caption.
+    Call Abhishek /abhishek/describe-image and speak only if a picture is on the page.
+    Returns True when a caption was spoken.
     """
     if image_path is None or not Path(image_path).exists():
-        return
+        return False
 
     try:
         with open(image_path, "rb") as image_file:
@@ -283,7 +284,7 @@ def describe_page_visual(
     except Exception as error:
         print("Abhishek describe-image failed:")
         print(error)
-        return
+        return False
 
     description = (
         result.get("image_description")
@@ -294,6 +295,39 @@ def describe_page_visual(
 
     if is_meaningful_image_description(description, has_image=has_image):
         speak_reading_text(str(description).strip(), preferences)
+        return True
+
+    print("Describe skipped: no picture on the page.")
+    return False
+
+
+def print_runtime_endpoints() -> None:
+    print("Abhishek analyze:", ABHISHEK_ANALYZE_URL)
+    print("Abhishek describe:", ABHISHEK_DESCRIBE_URL)
+    print("Harshaka analyze:", os.getenv("HARSHAAKA_ANALYZE_URL", "http://127.0.0.1:8001/analyze"))
+    print("Harshaka generate:", os.getenv("HARSHAAKA_GENERATE_URL", "http://127.0.0.1:8001/generate-output"))
+    print("Rashmi TTS:", os.getenv("RASHMI_TTS_URL") or "(local only)")
+
+
+def send_image_to_abhishek(image_path: Path) -> Optional[Dict]:
+    print("Controller sending image to Abhishek:", ABHISHEK_ANALYZE_URL)
+    try:
+        with open(image_path, "rb") as image_file:
+            response = requests.post(
+                ABHISHEK_ANALYZE_URL,
+                files={"file": (image_path.name, image_file, "image/jpeg")},
+                timeout=180,
+            )
+        response.raise_for_status()
+        result = response.json()
+        result["captured_image_path"] = str(image_path)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        with open(ABHISHEK_RESULT_PATH, "w", encoding="utf-8") as file:
+            json.dump(result, file, indent=4)
+        return result
+    except Exception as error:
+        print("Controller Abhishek request failed:", error)
+        return None
 
 
 def run_camera_once(preferences: Dict, target_module: str) -> bool:
@@ -312,16 +346,16 @@ def run_camera_once(preferences: Dict, target_module: str) -> bool:
 
     env = os.environ.copy()
     env["NEXT_MODULE_TARGET"] = target_module
-    env["RASHMI_VOICE"] = str(preferences.get("voice") or preferences.get("voice_type") or "female")
-    env["RASHMI_PACE"] = str(preferences.get("pace") or "normal")
-    env["RASHMI_TONE"] = str(preferences.get("tone") or "friendly")
+    env["RASHMI_VOICE"] = "female"
+    env["RASHMI_PACE"] = "normal"
+    env["RASHMI_TONE"] = "natural"
 
     if target_module == "abhishek":
-        speak("Opening camera guidance to capture the first page.", preferences)
+        speak("Now I will turn on the camera.", preferences)
+        speak("Please wait. The camera model is loading.", preferences)
     else:
-        speak("Opening camera guidance to capture the page.", preferences)
-
-    speak("Please wait. The camera model is loading.", preferences)
+        speak("Opening the camera to capture the page.", preferences)
+        speak("Please wait. The camera model is loading.", preferences)
 
     print("Starting camera script:", CAMERA_SCRIPT)
     print("Target module:", target_module)
@@ -345,7 +379,21 @@ def ask_continue_or_stop(preferences: Dict, question: str) -> str:
     return ask_by_voice(
         question=question,
         valid_answers=["next", "stop"],
-        default_answer="next",
+        default_answer="stop",
+        preferences=preferences,
+        attempts=3,
+        max_seconds=8,
+    )
+
+
+def ask_new_material_or_end(preferences: Dict) -> str:
+    return ask_by_voice(
+        question=(
+            "Do you want to start a new novel, newspaper, magazine, report, or letter? "
+            "Say new to start a new material, or say end to finish the session."
+        ),
+        valid_answers=["new", "end"],
+        default_answer="end",
         preferences=preferences,
         attempts=3,
         max_seconds=8,
@@ -356,11 +404,17 @@ def select_harshaka_category(
     analysis_result: Dict,
     document_type: str,
     preferences: Dict,
+    announce_empty: bool = True,
 ) -> Optional[str]:
     categories: List[str] = get_available_categories(analysis_result)
+    if str(document_type or "").strip().lower() == "newspaper":
+        categories = [
+            item for item in categories if str(item).strip().lower() != "story"
+        ]
 
     if not categories:
-        speak("No readable content was found for this page.", preferences)
+        if announce_empty:
+            speak("No readable content was found for this page.", preferences)
         return None
 
     if len(categories) == 1:
@@ -373,7 +427,8 @@ def select_harshaka_category(
     valid_map = {item.lower(): item for item in categories}
 
     if selected_normalized not in valid_map:
-        speak("No readable content was found for this page.", preferences)
+        if announce_empty:
+            speak("No readable content was found for this page.", preferences)
         return None
 
     return valid_map[selected_normalized]
@@ -389,9 +444,11 @@ def run_harshaka_reading_for_image(
 ):
     """
     Send image + document type to Harshaka.
-    Select a real detected category only.
-    Speak Harshaka text, then optional Abhishek image description.
+    Select a real detected category only. Never invent categories.
+    Speak Harshaka text when available, then describe a picture on the page
+    if one exists. Picture-only pages still get a description.
     """
+    spoke_text = False
     try:
         speak("Sending page to content reading module.", preferences)
 
@@ -408,54 +465,65 @@ def run_harshaka_reading_for_image(
             "extracted_text_preview": (analysis_result.get("extracted_text") or "")[:500],
         }, indent=4))
 
-        if str(analysis_result.get("status", "")).lower() == "failed":
-            speak("No readable content was found for this page.", preferences)
-            return
+        status_failed = str(analysis_result.get("status", "")).lower() == "failed"
+        selected_category = None
+        if not status_failed:
+            selected_category = select_harshaka_category(
+                analysis_result=analysis_result,
+                document_type=document_type,
+                preferences=preferences,
+                announce_empty=not bool(describe_context),
+            )
 
-        selected_category = select_harshaka_category(
-            analysis_result=analysis_result,
-            document_type=document_type,
-            preferences=preferences,
-        )
+        if selected_category:
+            if ask_depth:
+                depth = ask_summary_or_full(preferences)
+            else:
+                depth = default_depth
 
-        if not selected_category:
-            return
+            if depth not in {"summary", "full"}:
+                depth = default_depth if default_depth in {"summary", "full"} else "summary"
 
-        if ask_depth:
-            depth = ask_summary_or_full(preferences)
-        else:
-            depth = default_depth
+            speak(
+                f"Preparing {depth} for {selected_category}.",
+                preferences,
+            )
 
-        if depth not in {"summary", "full"}:
-            depth = default_depth if default_depth in {"summary", "full"} else "summary"
+            final_result = generate_selected_harshaka_output(
+                analysis_result=analysis_result,
+                selected_category=selected_category,
+                depth=depth,
+            )
 
-        speak(
-            f"Preparing {depth} for {selected_category}.",
-            preferences,
-        )
+            print("Harshaka final result:")
+            print(json.dumps(final_result, indent=4))
 
-        final_result = generate_selected_harshaka_output(
-            analysis_result=analysis_result,
-            selected_category=selected_category,
-            depth=depth,
-        )
+            speak_harshaka_result(final_result, preferences)
+            spoke_text = True
 
-        print("Harshaka final result:")
-        print(json.dumps(final_result, indent=4))
-
-        speak_harshaka_result(final_result, preferences)
-
+        described = False
         if describe_context:
-            describe_page_visual(
+            described = describe_page_visual(
                 image_path=image_path,
                 context=describe_context,
                 preferences=preferences,
             )
 
+        if not spoke_text and not described:
+            speak("No readable content was found for this page.", preferences)
+
     except Exception as error:
         print("Harshaka reading failed:")
         print(error)
-        speak("Content reading module failed for this page.", preferences)
+        described = False
+        if describe_context:
+            described = describe_page_visual(
+                image_path=image_path,
+                context=describe_context,
+                preferences=preferences,
+            )
+        if not described:
+            speak("Content reading module failed for this page.", preferences)
 
 
 def run_page_loop(
@@ -499,8 +567,10 @@ def run_novel_loop(preferences: Dict):
     run_page_loop(
         preferences=preferences,
         document_type="Novel",
-        turn_page_message="Please turn to the next page of the novel.",
-        continue_question="Say next to continue to the next page, or say stop to finish.",
+        turn_page_message="This page is finished.",
+        continue_question=(
+            "Turn to the next page and say next, or say stop."
+        ),
         stop_message="Novel reading stopped.",
         describe_context="novel_page",
         missing_image_message="Captured page image was not found.",
@@ -511,8 +581,10 @@ def run_magazine_loop(preferences: Dict):
     run_page_loop(
         preferences=preferences,
         document_type="Magazine",
-        turn_page_message="Please turn to the next page of the magazine.",
-        continue_question="Say next to continue to the next page, or say stop to finish.",
+        turn_page_message="This page is finished.",
+        continue_question=(
+            "Turn to the next page and say next, or say stop."
+        ),
         stop_message="Magazine reading stopped.",
         describe_context="magazine_page",
         missing_image_message="Captured page image was not found.",
@@ -535,7 +607,7 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
     while True:
         choice = ask_continue_or_stop(
             preferences,
-            "Say next to capture one article, or say stop to finish.",
+            "Say next to capture one article, or say stop.",
         )
 
         if choice == "stop":
@@ -559,8 +631,6 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
             default_depth="summary",
             describe_context="newspaper_article_image",
         )
-
-        speak("Move to another article and say next, or say stop to finish.", preferences)
 
 
 def run_report_flow(image_path: Optional[Path], preferences: Dict):
@@ -606,36 +676,51 @@ def run_single_image_document(
         describe_context=describe_context,
     )
 
+    while True:
+        choice = ask_continue_or_stop(
+            preferences,
+            "This page is finished. Say next to read the next page, or say stop.",
+        )
+        if choice == "stop":
+            break
 
-def main():
-    print("==========================================")
-    print("SMART READING ASSISTANT FULL CONTROLLER")
-    print("Rashmi + Manoj + Abhishek + Harshaka")
-    print("==========================================")
+        ok = run_camera_once(preferences, target_module="capture_only")
+        if not ok:
+            break
 
-    configure_rfid_for_pi()
-    preferences = get_user_preferences()
-    save_current_preferences(preferences)
+        next_image = get_latest_captured_image_path()
+        if next_image is None:
+            speak("Captured page image was not found.", preferences)
+            continue
 
-    print("\nCurrent user preferences:")
-    print(json.dumps(preferences, indent=4))
+        run_harshaka_reading_for_image(
+            image_path=next_image,
+            document_type=document_type,
+            preferences=preferences,
+            ask_depth=ask_depth,
+            default_depth=default_depth,
+            describe_context=describe_context,
+        )
 
+
+def capture_and_identify_document(preferences: Dict) -> Optional[Dict]:
     ok = run_camera_once(preferences, target_module="abhishek")
     if not ok:
-        return
+        return None
 
     abhishek_result = read_json_file(ABHISHEK_RESULT_PATH)
-    if not abhishek_result:
-        speak("Abhishek analysis result was not found.", preferences)
-        return
+    if not abhishek_result or str(abhishek_result.get("status", "")).lower() == "failed":
+        image_path = get_latest_captured_image_path()
+        if image_path is not None:
+            speak("Sending the page for analysis again.", preferences)
+            retried = send_image_to_abhishek(image_path)
+            if retried:
+                abhishek_result = retried
 
-    print("Abhishek result:")
-    print(json.dumps(abhishek_result, indent=4))
+    return abhishek_result
 
-    if str(abhishek_result.get("status", "")).lower() == "failed":
-        speak("Document analysis failed.", preferences)
-        return
 
+def run_document_workflow(abhishek_result: Dict, preferences: Dict) -> None:
     document_type = normalize_document_type(abhishek_result.get("document_type"))
     first_image_path = resolve_image_path(abhishek_result)
 
@@ -654,6 +739,42 @@ def main():
     else:
         speak(
             "The document type could not be identified clearly.",
+            preferences,
+        )
+
+
+def main():
+    print("==========================================")
+    print("SMART READING ASSISTANT FULL CONTROLLER")
+    print("Rashmi + Manoj + Abhishek + Harshaka")
+    print("==========================================")
+
+    configure_rfid_for_pi()
+    print_runtime_endpoints()
+    preferences = get_user_preferences()
+    save_current_preferences(preferences)
+
+    print("\nCurrent user preferences:")
+    print(json.dumps(preferences, indent=4))
+
+    while True:
+        abhishek_result = capture_and_identify_document(preferences)
+
+        if not abhishek_result:
+            speak("Abhishek analysis result was not found.", preferences)
+        elif str(abhishek_result.get("status", "")).lower() == "failed":
+            speak("Document analysis failed.", preferences)
+        else:
+            print("Abhishek result:")
+            print(json.dumps(abhishek_result, indent=4))
+            run_document_workflow(abhishek_result, preferences)
+
+        choice = ask_new_material_or_end(preferences)
+        if choice != "new":
+            break
+
+        speak(
+            "Please place the new reading material in front of the camera.",
             preferences,
         )
 

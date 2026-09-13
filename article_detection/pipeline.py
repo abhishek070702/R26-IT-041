@@ -16,7 +16,15 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()
+_BACKEND_DIR = Path(__file__).resolve().parent
+_ROOT = _BACKEND_DIR.parent
+for _env_path in (
+    _BACKEND_DIR / ".env",
+    _ROOT / ".env",
+    _ROOT / "backend" / ".env",
+):
+    if _env_path.is_file():
+        load_dotenv(_env_path, override=True)
 
 from adaptive_content_pipeline_v7_openai_fallback import (
     ApplicationFallbackConfig,
@@ -25,6 +33,7 @@ from adaptive_content_pipeline_v7_openai_fallback import (
     generate_selected_output_v7,
     load_category_model,
     load_doclayout_model,
+    sanitize_newspaper_category,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,15 +109,52 @@ def _join_article_text(results: Any) -> str:
 
 
 def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
-    categories = (
-        analysis.get("categories")
-        or analysis.get("detected_categories")
-        or []
-    )
-    analysis["categories"] = list(categories)
-    analysis["detected_categories"] = list(
-        analysis.get("detected_categories") or categories
-    )
+    document_type = str(analysis.get("document_type") or "")
+    is_newspaper = "news" in document_type.lower()
+
+    def _fix_category(value: Any, item: dict[str, Any] | None = None) -> str:
+        category = str(value or "").strip()
+        if is_newspaper:
+            return sanitize_newspaper_category(
+                category,
+                (item or {}).get("top_predictions"),
+            )
+        return category
+
+    if is_newspaper:
+        for key in ("local_results", "ai_results", "results", "articles"):
+            items = analysis.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and item.get("category"):
+                        item["category"] = _fix_category(item.get("category"), item)
+
+        rebuilt: list[str] = []
+        seen: set[str] = set()
+        for key in ("local_results", "ai_results", "results", "articles"):
+            items = analysis.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("category") or "").strip()
+                key_name = name.lower()
+                if name and key_name != "story" and key_name not in seen:
+                    rebuilt.append(name)
+                    seen.add(key_name)
+        analysis["categories"] = list(rebuilt)
+        analysis["detected_categories"] = list(rebuilt)
+    else:
+        categories = (
+            analysis.get("categories")
+            or analysis.get("detected_categories")
+            or []
+        )
+        analysis["categories"] = list(categories)
+        analysis["detected_categories"] = list(
+            analysis.get("detected_categories") or categories
+        )
 
     local_results = analysis.get("local_results")
     if not isinstance(local_results, list) or not local_results:

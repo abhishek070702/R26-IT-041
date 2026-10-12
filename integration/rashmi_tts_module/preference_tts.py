@@ -13,7 +13,6 @@ import os
 import platform
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -201,12 +200,31 @@ def _edge_voice_name(preferences: Optional[Dict] = None) -> str:
 
 
 def _edge_voice_candidates(preferences: Optional[Dict] = None) -> list[str]:
-    primary = _edge_voice_name(preferences)
-    fallback = VOICE_MAP[_voice_key(preferences)]
-    candidates = [primary]
-    if fallback != primary:
-        candidates.append(fallback)
+    voice_key = _voice_key(preferences)
+    ordered = [
+        _edge_voice_name(preferences),
+        VOICE_MAP[voice_key],
+        "en-US-JennyNeural",
+        "en-US-GuyNeural",
+        "en-US-AriaNeural" if voice_key == "female" else "en-US-AndrewNeural",
+    ]
+    candidates: list[str] = []
+    for name in ordered:
+        if name not in candidates:
+            candidates.append(name)
     return candidates
+
+
+def _edge_prosody_candidates(
+    preferences: Optional[Dict] = None,
+) -> list[tuple[str, str, str]]:
+    rate = _edge_rate(preferences)
+    tone_cfg = TONE_MAP.get(_tone_key(preferences), TONE_MAP["natural"])
+    styled = (rate, tone_cfg["pitch"], tone_cfg["volume"])
+    plain = ("+0%", "+0Hz", "+0%")
+    if styled == plain:
+        return [plain]
+    return [styled, plain]
 
 
 def _edge_rate(preferences: Optional[Dict] = None) -> str:
@@ -306,8 +324,10 @@ async def _edge_save(text: str, voice_name: str, rate: str, pitch: str, volume: 
 def _run_asyncio(coro):
     """Run a coroutine even if FastAPI already has an event loop."""
     try:
-        asyncio.get_running_loop()
+        running_loop = asyncio.get_running_loop()
     except RuntimeError:
+        running_loop = None
+    if running_loop is None:
         return asyncio.run(coro)
 
     result = {}
@@ -326,38 +346,6 @@ def _run_asyncio(coro):
     return result.get("value")
 
 
-def _synthesize_edge_cli(
-    text: str,
-    voice_name: str,
-    rate: str,
-    pitch: str,
-    volume: str,
-    out_path: Path,
-) -> None:
-    # Same CLI path as tts-preferences/Final 1.1.ipynb
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "edge_tts",
-            "--voice",
-            voice_name,
-            f"--rate={rate}",
-            f"--pitch={pitch}",
-            f"--volume={volume}",
-            "--text",
-            text,
-            "--write-media",
-            str(out_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "edge-tts CLI failed").strip())
-
-
 def _synthesize_edge_mp3(text: str, preferences: Optional[Dict] = None) -> Path:
     global _EDGE_UNAVAILABLE
     if _EDGE_UNAVAILABLE:
@@ -372,38 +360,31 @@ def _synthesize_edge_mp3(text: str, preferences: Optional[Dict] = None) -> Path:
     AUDIO_DIR.mkdir(exist_ok=True)
     voice_key = _voice_key(preferences)
     tone_key = _tone_key(preferences)
-    rate = _edge_rate(preferences)
-    tone_cfg = TONE_MAP.get(tone_key, TONE_MAP["natural"])
-    pitch = tone_cfg["pitch"]
-    volume = tone_cfg["volume"]
-    voice_candidates = _edge_voice_candidates(preferences)
-
     last_error: Exception | None = None
+
     with _EDGE_LOCK:
-        for voice_name in voice_candidates:
-            print(
-                "TTS engine=edge "
-                f"voice={voice_key} tone={tone_key} "
-                f"edge_voice={voice_name} rate={rate} pitch={pitch}"
-            )
-            for attempt in range(2):
+        for index, voice_name in enumerate(_edge_voice_candidates(preferences)):
+            combos = _edge_prosody_candidates(preferences)
+            if index > 0:
+                combos = [combos[-1]]
+            for rate, pitch, volume in combos:
+                print(
+                    "TTS engine=edge "
+                    f"voice={voice_key} tone={tone_key} "
+                    f"edge_voice={voice_name} rate={rate} pitch={pitch}"
+                )
                 out_path = AUDIO_DIR / f"rashmi_{uuid.uuid4().hex[:10]}.mp3"
                 try:
-                    try:
-                        _synthesize_edge_cli(
-                            text, voice_name, rate, pitch, volume, out_path
+                    _run_asyncio(
+                        _edge_save(
+                            text,
+                            voice_name,
+                            rate,
+                            pitch,
+                            volume,
+                            out_path,
                         )
-                    except Exception:
-                        _run_asyncio(
-                            _edge_save(
-                                text,
-                                voice_name,
-                                rate,
-                                pitch,
-                                volume,
-                                out_path,
-                            )
-                        )
+                    )
                     if out_path.exists() and out_path.stat().st_size > 0:
                         return out_path
                     last_error = RuntimeError("Edge TTS did not write audio.")
@@ -413,9 +394,12 @@ def _synthesize_edge_mp3(text: str, preferences: Optional[Dict] = None) -> Path:
                         out_path.unlink(missing_ok=True)
                     except OSError:
                         pass
-                    time.sleep(0.35 * (attempt + 1))
             print(f"Edge voice failed ({voice_name}); trying fallback if available.")
 
+    message = str(last_error or "")
+    if "No audio was received" in message:
+        _EDGE_UNAVAILABLE = True
+        print("Edge TTS got no audio from Microsoft; skipping Edge until restart.")
     raise RuntimeError(f"Edge TTS failed: {last_error}") from last_error
 
 
@@ -551,9 +535,11 @@ def _speak_espeak_or_windows(text: str, preferences: Optional[Dict] = None) -> N
         )
         return
     if shutil.which(command[0]) is None:
-        raise FileNotFoundError(
-            "No local voice on this device (install espeak-ng or set RASHMI_TTS_URL)."
+        print(
+            "No local voice on this device "
+            "(install espeak-ng, or keep the laptop TTS server running)."
         )
+        return
     subprocess.run(
         command,
         stdout=subprocess.DEVNULL,
@@ -843,7 +829,10 @@ def speak_preference_voice(
         _speak_edge(text, preferences)
     except Exception as error:
         print("Edge TTS failed, using offline voice:", error)
-        _speak_espeak_or_windows(text, preferences)
+        try:
+            _speak_espeak_or_windows(text, preferences)
+        except Exception as fallback_error:
+            print("Offline voice failed:", fallback_error)
 
 
 def preferences_from_env() -> Dict[str, str]:

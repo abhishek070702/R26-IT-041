@@ -278,18 +278,11 @@ def _openai_client():
         return _OPENAI_CLIENT
 
     _OPENAI_LOAD_ATTEMPTED = True
+    # load_dotenv(..., override=False): shell/process env wins over .env files.
+    # Prefer os.getenv (same as optimization/instant-reading-after-capture).
+    # Do not force backend/.env over an exported shell key.
     _load_env()
-    try:
-        from dotenv import dotenv_values
-        api_key = (
-            dotenv_values(PROJECT_ROOT / "backend" / ".env")
-            .get("OPENAI_API_KEY") or ""
-        ).strip()
-    except Exception:
-        api_key = ""
-
-    if not api_key:
-        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         print("OpenAI TTS key not found; reading will use Edge TTS.")
         _OPENAI_UNAVAILABLE = True
@@ -862,7 +855,15 @@ def speak_reading_voice(text: str, preferences: Optional[Dict] = None) -> None:
     if not text:
         return
 
+    started = time.perf_counter()
+    engine_used = "unknown"
+
     if _speak_via_tts_server(text, preferences):
+        engine_used = "laptop-server"
+        print(
+            f"[tts] timing first_reading_playback_path="
+            f"{time.perf_counter() - started:.2f}s engine={engine_used} chars={len(text)}"
+        )
         return
 
     engine = _engine_name()
@@ -872,11 +873,20 @@ def speak_reading_voice(text: str, preferences: Optional[Dict] = None) -> None:
 
     try:
         _speak_openai(text, preferences)
+        engine_used = "openai"
+        print(
+            f"[tts] timing first_reading_playback_path="
+            f"{time.perf_counter() - started:.2f}s engine={engine_used} chars={len(text)}"
+        )
         return
     except Exception as error:
         print("OpenAI TTS failed, using Edge voice:", error)
 
     speak_preference_voice(text, preferences, allow_remote=False)
+    print(
+        f"[tts] timing first_reading_playback_path="
+        f"{time.perf_counter() - started:.2f}s engine=edge-or-local chars={len(text)}"
+    )
 
 
 def speak_preference_voice(
@@ -885,26 +895,50 @@ def speak_preference_voice(
     allow_remote: bool = True,
 ) -> None:
     """
-    Final 1.1 voice: OpenAI TTS (tone voices + style) when a key is available.
-    Edge Jenny/Guy is only the fallback.
+    System / guidance voice.
+
+    Honors RASHMI_TTS_ENGINE (default: edge) so welcome and RFID prompts do not
+    wait on OpenAI when Edge is configured. OpenAI is used when the engine is
+    explicitly openai/gpt. Document reading still uses speak_reading_voice.
     """
     text = str(text or "").strip()
     if not text:
         return
 
+    started = time.perf_counter()
+    engine_used = "unknown"
+
     if allow_remote and _speak_via_tts_server(text, preferences):
+        engine_used = "laptop-server"
+        print(
+            f"[tts] timing system_speech={time.perf_counter() - started:.2f}s "
+            f"engine={engine_used} chars={len(text)}"
+        )
         return
 
     engine = _engine_name()
     if engine in {"espeak", "espeak-ng", "local"}:
         _speak_espeak_or_windows(text, preferences)
+        engine_used = "local"
+        print(
+            f"[tts] timing system_speech={time.perf_counter() - started:.2f}s "
+            f"engine={engine_used} chars={len(text)}"
+        )
         return
 
-    try:
-        _speak_openai(text, preferences)
-        return
-    except Exception as error:
-        print("OpenAI TTS failed, using Edge voice:", error)
+    # Default and explicit Edge: skip OpenAI for guidance (faster RFID/welcome).
+    prefer_openai = engine in {"openai", "gpt", "gpt-4o", "gpt4o"}
+    if prefer_openai:
+        try:
+            _speak_openai(text, preferences)
+            engine_used = "openai"
+            print(
+                f"[tts] timing system_speech={time.perf_counter() - started:.2f}s "
+                f"engine={engine_used} chars={len(text)}"
+            )
+            return
+        except Exception as error:
+            print("OpenAI TTS failed, using Edge voice:", error)
 
     try:
         print(
@@ -914,12 +948,32 @@ def speak_preference_voice(
             f"tone={_tone_key(preferences)}"
         )
         _speak_edge(text, preferences)
+        engine_used = "edge"
     except Exception as error:
         print("Edge TTS failed, using offline voice:", error)
         try:
+            if not prefer_openai:
+                try:
+                    _speak_openai(text, preferences)
+                    engine_used = "openai-fallback"
+                    print(
+                        f"[tts] timing system_speech="
+                        f"{time.perf_counter() - started:.2f}s "
+                        f"engine={engine_used} chars={len(text)}"
+                    )
+                    return
+                except Exception as openai_error:
+                    print("OpenAI TTS fallback failed:", openai_error)
             _speak_espeak_or_windows(text, preferences)
+            engine_used = "local-fallback"
         except Exception as fallback_error:
             print("Offline voice failed:", fallback_error)
+            engine_used = "failed"
+
+    print(
+        f"[tts] timing system_speech={time.perf_counter() - started:.2f}s "
+        f"engine={engine_used} chars={len(text)}"
+    )
 
 
 def preferences_from_env() -> Dict[str, str]:

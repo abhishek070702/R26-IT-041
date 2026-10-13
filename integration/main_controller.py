@@ -378,7 +378,8 @@ def send_image_to_abhishek(image_path: Path) -> Optional[Dict]:
                 timeout=_HTTP_TIMEOUT,
             )
         print(
-            f"[controller] timing abhishek_analyze={time.perf_counter() - started:.2f}s"
+            "[controller] timing capture_to_abhishek_response="
+            f"{time.perf_counter() - started:.2f}s"
         )
         response.raise_for_status()
         result = response.json()
@@ -522,6 +523,7 @@ def run_harshaka_reading_for_image(
     described = False
     flow_started = time.perf_counter()
     try:
+        harshaka_analyze_started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=1) as pool:
             analyze_future = pool.submit(
                 analyze_page_with_harshaka,
@@ -530,6 +532,10 @@ def run_harshaka_reading_for_image(
             )
             speak("Sending page to content reading module.", preferences)
             analysis_result = analyze_future.result()
+        print(
+            "[controller] timing harshaka_analyze="
+            f"{time.perf_counter() - harshaka_analyze_started:.2f}s"
+        )
 
         print("Harshaka analysis result preview:")
         print(json.dumps({
@@ -558,6 +564,7 @@ def run_harshaka_reading_for_image(
             if depth not in {"summary", "full"}:
                 depth = default_depth if default_depth in {"summary", "full"} else "summary"
 
+            generate_started = time.perf_counter()
             with ThreadPoolExecutor(max_workers=1) as pool:
                 generate_future = pool.submit(
                     generate_selected_harshaka_output,
@@ -570,6 +577,10 @@ def run_harshaka_reading_for_image(
                     preferences,
                 )
                 final_result = generate_future.result()
+            print(
+                "[controller] timing harshaka_generate="
+                f"{time.perf_counter() - generate_started:.2f}s"
+            )
 
             print("Harshaka final result:")
             print(json.dumps(final_result, indent=4))

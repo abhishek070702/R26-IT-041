@@ -1,0 +1,839 @@
+import json
+import os
+import platform
+import queue
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+try:
+    from .simplifier import simplify_text
+    from .pn532_rfid import read_rfid_uid
+    from .preference_tts import (
+        speak_preference_voice,
+        speak_reading_voice,
+        system_speech_preferences,
+    )
+    from .tone_classifier import classify_live_tone, classifier_ready
+except ImportError:
+    from simplifier import simplify_text
+    from pn532_rfid import read_rfid_uid
+    from preference_tts import (
+        speak_preference_voice,
+        speak_reading_voice,
+        system_speech_preferences,
+    )
+    from tone_classifier import classify_live_tone, classifier_ready
+
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent.parent
+
+DB_PATH = BASE_DIR / "users.db"
+CURRENT_PREF_PATH = BASE_DIR / "current_preferences.json"
+
+VOSK_MODEL_PATH = Path(
+    os.getenv(
+        "VOSK_MODEL_PATH",
+        str(PROJECT_ROOT / "tts-preferences" / "vosk-model-small-en-us-0.15")
+    )
+)
+
+MIC_DEVICE = os.getenv("RASHMI_MIC_DEVICE", "plughw:2,0")
+SAMPLE_RATE = int(os.getenv("RASHMI_SAMPLE_RATE", "16000"))
+
+_VOSK_MODEL = None
+
+
+def _voice_name(preferences: Optional[Dict] = None) -> str:
+    if not preferences:
+        return "female"
+    voice = str(
+        preferences.get("voice")
+        or preferences.get("voice_type")
+        or "female"
+    ).lower()
+    return "male" if voice == "male" else "female"
+
+
+def speak(text: str, preferences: Optional[Dict] = None):
+    """
+    System guidance voice. Same as the welcome message.
+    User reading prefs (voice, pace, tone, reading_level) are ignored.
+    """
+    if not text:
+        return
+
+    text = str(text).strip()
+    if not text:
+        return
+
+    print("TTS:", text)
+    try:
+        speak_preference_voice(text, system_speech_preferences())
+    except Exception as error:
+        print("TTS error:", error)
+
+
+def speak_reading_text(text: str, preferences: Optional[Dict] = None):
+    """
+    Speak actual reading material only: title, cover/page pictures, Harshaka text.
+    Applies saved reading_level, voice, pace, and tone.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return ""
+
+    level = ""
+    if preferences:
+        level = str(preferences.get("reading_level") or "")
+
+    adapted = simplify_text(text, level)
+    if adapted != text:
+        print("Reading text adapted for level:", level or "very simple")
+
+    try:
+        speak_reading_voice(adapted, preferences)
+    except Exception as error:
+        print("Reading TTS error:", error)
+    return adapted
+
+
+def init_database():
+    """
+    Create a stable user preference table.
+    This uses user_preferences table to avoid old users table schema problems.
+    """
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            rfid_id TEXT PRIMARY KEY,
+            reading_level TEXT,
+            voice TEXT,
+            pace TEXT,
+            tone TEXT
+        )
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def find_user(rfid_id: str):
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    cursor = connection.cursor()
+
+    cursor.execute(
+        "SELECT * FROM user_preferences WHERE rfid_id = ?",
+        (rfid_id,)
+    )
+    row = cursor.fetchone()
+
+    connection.close()
+
+    if row is None:
+        return None
+
+    return dict(row)
+
+
+def _preferences_from_user(user: Dict) -> Dict:
+    return {
+        "rfid_id": user.get("rfid_id") or "DEFAULT_USER",
+        "reading_level": user.get("reading_level") or "very simple",
+        "voice": user.get("voice") or "female",
+        "voice_type": user.get("voice") or user.get("voice_type") or "female",
+        "pace": user.get("pace") or "normal",
+        "tone": user.get("tone") or "friendly",
+    }
+
+
+def find_any_saved_user():
+    saved = load_current_preferences()
+    if isinstance(saved, dict) and saved.get("reading_level"):
+        return _preferences_from_user(saved)
+
+    for user_id in (
+        os.getenv("RASHMI_USER_ID", "DEFAULT_USER"),
+        "CARD0001",
+        "DEFAULT_USER",
+    ):
+        user = find_user(user_id)
+        if user is not None:
+            return _preferences_from_user(user)
+
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    cursor = connection.cursor()
+    cursor.execute("SELECT * FROM user_preferences ORDER BY rowid DESC LIMIT 1")
+    row = cursor.fetchone()
+    connection.close()
+    if row is None:
+        return None
+    return _preferences_from_user(dict(row))
+
+
+def save_user_preferences(
+    rfid_id: str,
+    reading_level: str,
+    voice: str,
+    pace: str,
+    tone: str,
+):
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO user_preferences
+        (rfid_id, reading_level, voice, pace, tone)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (rfid_id, reading_level, voice, pace, tone),
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def save_current_preferences(preferences: Dict):
+    BASE_DIR.mkdir(exist_ok=True)
+
+    with open(CURRENT_PREF_PATH, "w", encoding="utf-8") as file:
+        json.dump(preferences, file, indent=4)
+
+    print("Current preferences saved to:", CURRENT_PREF_PATH)
+
+
+def load_current_preferences():
+    if not CURRENT_PREF_PATH.exists():
+        return None
+
+    with open(CURRENT_PREF_PATH, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def _get_vosk_model():
+    global _VOSK_MODEL
+
+    if _VOSK_MODEL is not None:
+        return _VOSK_MODEL
+
+    if not VOSK_MODEL_PATH.exists():
+        print("Vosk model not found:", VOSK_MODEL_PATH)
+        return None
+
+    try:
+        from vosk import Model, SetLogLevel
+
+        SetLogLevel(-1)
+        print("Loading Vosk speech model...")
+        _VOSK_MODEL = Model(str(VOSK_MODEL_PATH))
+        print("Vosk speech model ready.")
+        return _VOSK_MODEL
+    except Exception as error:
+        print("Could not load Vosk model:", error)
+        return None
+
+
+def _preload_speech_models():
+    try:
+        _get_vosk_model()
+    except Exception as error:
+        print("Vosk preload failed:", error)
+    try:
+        classifier_ready()
+    except Exception as error:
+        print("Tone classifier preload failed:", error)
+
+
+def _typed_input_requested() -> bool:
+    return os.getenv("RASHMI_TYPED_INPUT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _windows_mic_device():
+    raw = os.getenv("RASHMI_WINDOWS_MIC_DEVICE", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+ANSWER_ALIASES = {
+    "summary": ["summary", "summery", "summarize", "short", "brief"],
+    "full": ["full", "all", "read it", "read full", "full text", "whole", "complete"],
+    "next": [
+        "next",
+        "nest",
+        "necks",
+        "go",
+        "continue",
+        "proceed",
+        "ready",
+        "really",
+        "next page",
+    ],
+    "stop": ["stop", "quit"],
+    "new": ["new", "another", "material", "restart", "again", "start"],
+    "end": ["end", "finish", "quit", "exit", "close", "done", "stop"],
+    "yes": ["yes", "yeah", "yep", "ok", "okay"],
+    "no": ["no", "nope"],
+    "ready": ["ready", "done", "finished"],
+    "very simple": ["very simple", "simple", "very easy", "easy"],
+    "simple": ["simple", "easy", "very simple"],
+    "moderate": ["moderate", "medium", "normal level"],
+    "light": ["light", "original", "close to original", "advanced", "advance", "hard"],
+    "advanced": ["advanced", "advance", "hard", "light"],
+    "male": ["male", "mail", "man"],
+    "female": ["female", "email", "woman"],
+    "slow": ["slow"],
+    "normal": ["normal"],
+    "fast": ["fast"],
+    "calm": ["calm", "come", "peaceful", "soft"],
+    "friendly": ["friendly", "friend", "warm", "kind"],
+    "natural": ["natural", "neutral"],
+    "emotional": [
+        "emotional",
+        "emotion",
+        "imotional",
+        "dramatic",
+        "expressive",
+    ],
+    "supportive": ["supportive", "support"],
+    "story": ["story"],
+    "sports": ["sports", "sport"],
+    "politics": ["politics", "politic", "political"],
+    "science": ["science"],
+    "social": ["social"],
+    "general": ["general"],
+    "general text": ["general", "general text"],
+    "mathematics": ["mathematics", "maths", "math"],
+}
+
+
+def _make_vosk_recognizer(model, sample_rate: int, valid_answers: Optional[List[str]] = None):
+    from vosk import KaldiRecognizer
+
+    phrases = set()
+    for answer in valid_answers or []:
+        valid = str(answer).lower().strip()
+        if not valid:
+            continue
+        phrases.add(valid)
+        phrases.update(ANSWER_ALIASES.get(valid, []))
+
+    if phrases:
+        grammar = sorted(phrases) + ["[unk]"]
+        return KaldiRecognizer(model, sample_rate, json.dumps(grammar))
+
+    return KaldiRecognizer(model, sample_rate)
+
+
+def _clean_recognized_text(text: str) -> str:
+    cleaned = str(text or "").strip().lower()
+    if cleaned in {"[unk]", "unk"}:
+        return ""
+    return cleaned
+
+
+def _listen_with_sounddevice(
+    max_seconds: int,
+    valid_answers: Optional[List[str]] = None,
+) -> str:
+    import sounddevice as sd
+
+    model = _get_vosk_model()
+    if model is None:
+        raise RuntimeError("Vosk model not available")
+
+    device = _windows_mic_device()
+    try:
+        info = sd.query_devices(device, "input")
+        print("Microphone:", info.get("name", "default"))
+    except Exception as error:
+        print("Microphone query failed:", error)
+
+    recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
+    audio_queue: queue.Queue = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            print("Audio status:", status)
+        audio_queue.put(bytes(indata))
+
+    print("Speak now...")
+    detected_text = ""
+    started = time.monotonic()
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=4000,
+        device=device,
+        dtype="int16",
+        channels=1,
+        callback=callback,
+    ):
+        while time.monotonic() - started < max_seconds:
+            try:
+                data = audio_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                text = _clean_recognized_text(result.get("text", ""))
+                if text:
+                    detected_text = text
+                    break
+
+    if not detected_text:
+        final_result = json.loads(recognizer.FinalResult())
+        detected_text = _clean_recognized_text(final_result.get("text", ""))
+
+    print("Recognized speech:", detected_text)
+    return detected_text
+
+
+def listen_once(
+    max_seconds: int = 8,
+    valid_answers: Optional[List[str]] = None,
+) -> str:
+    """
+    Listen for one answer.
+    Windows uses the laptop microphone + Vosk.
+    Raspberry Pi/Linux uses arecord + Vosk.
+    Set RASHMI_TYPED_INPUT=1 to type instead.
+    """
+    if _typed_input_requested():
+        return input("Type answer: ").strip().lower()
+
+    system_name = platform.system().lower()
+
+    if "windows" in system_name:
+        try:
+            return _listen_with_sounddevice(max_seconds, valid_answers)
+        except Exception as error:
+            print("Voice input error:", error)
+            return input("Voice input failed. Type answer: ").strip().lower()
+
+    model = _get_vosk_model()
+
+    if model is None:
+        return input("Voice model unavailable. Type answer: ").strip().lower()
+
+    try:
+        recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
+
+        process = subprocess.Popen(
+            [
+                "arecord",
+                "-D", MIC_DEVICE,
+                "-f", "S16_LE",
+                "-r", str(SAMPLE_RATE),
+                "-c", "1",
+                "-t", "raw",
+                "-d", str(max_seconds),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        detected_text = ""
+
+        try:
+            while True:
+                data = process.stdout.read(4000)
+
+                if not data:
+                    break
+
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    text = _clean_recognized_text(result.get("text", ""))
+
+                    if text:
+                        detected_text = text
+                        break
+
+            if not detected_text:
+                final_result = json.loads(recognizer.FinalResult())
+                detected_text = _clean_recognized_text(final_result.get("text", ""))
+
+        finally:
+            process.terminate()
+            process.wait()
+
+        print("Recognized speech:", detected_text)
+        return detected_text
+
+    except Exception as error:
+        print("Voice input error:", error)
+        return input("Voice input failed. Type answer: ").strip().lower()
+
+
+def _phrase_in_answer(phrase: str, answer_text: str) -> bool:
+    phrase = str(phrase).lower().strip()
+    answer_text = str(answer_text).lower().strip()
+
+    if not phrase:
+        return False
+
+    pattern = r"\b" + re.escape(phrase) + r"\b"
+    return re.search(pattern, answer_text) is not None
+
+
+def _match_answer(answer_text: str, valid_answers: List[str]):
+    """
+    Match recognized/typed answer to allowed answers safely.
+    Avoids bug where 'female' becomes 'male'.
+    """
+    answer_text = str(answer_text).lower().strip()
+    answer_compact = _compact(answer_text)
+
+    # 1. Exact match first
+    for valid in valid_answers:
+        valid_lower = str(valid).lower().strip()
+        if answer_text == valid_lower or answer_compact == _compact(valid_lower):
+            return valid
+
+    # 2. Exact alias match
+    for valid in valid_answers:
+        valid_lower = str(valid).lower().strip()
+        for alias in ANSWER_ALIASES.get(valid_lower, []):
+            if answer_text == alias or answer_compact == _compact(alias):
+                return valid
+
+    # 3. Word/phrase match only. No unsafe substring match.
+    for valid in valid_answers:
+        valid_lower = str(valid).lower().strip()
+
+        if _phrase_in_answer(valid_lower, answer_text):
+            return valid
+
+        for alias in ANSWER_ALIASES.get(valid_lower, []):
+            if _phrase_in_answer(alias, answer_text):
+                return valid
+
+    return None
+
+
+def ask_by_voice(
+    question: str,
+    valid_answers: List[str],
+    default_answer: Optional[str] = None,
+    preferences: Optional[Dict] = None,
+    attempts: int = 3,
+    max_seconds: int = 8,
+):
+    """
+    Ask user by Rashmi TTS and capture answer with Vosk.
+    Set RASHMI_TYPED_INPUT=1 to type instead of speaking.
+    """
+    valid_answers = [str(answer) for answer in valid_answers]
+
+    for attempt in range(1, attempts + 1):
+        speak(question, preferences)
+
+        allowed_text = ", ".join(valid_answers)
+        print(f"Allowed answers: {allowed_text}")
+        print(f"Listening... attempt {attempt}/{attempts}")
+
+        answer_text = listen_once(
+            max_seconds=max_seconds,
+            valid_answers=valid_answers,
+        )
+        selected = _match_answer(answer_text, valid_answers)
+
+        if selected is not None:
+            speak(f"You selected {selected}.", preferences)
+            return selected
+
+        speak("Sorry, I did not understand. Please try again.", preferences)
+
+    if default_answer is None:
+        default_answer = valid_answers[0] if valid_answers else ""
+
+    speak(f"I will use {default_answer}.", preferences)
+    return default_answer
+
+
+def ask_category_by_voice(categories: List[str], preferences: Optional[Dict] = None):
+    """
+    Ask user to select a detected Harshaka category by category name.
+    """
+    clean_categories = [str(category) for category in categories if str(category).strip()]
+
+    if not clean_categories:
+        return "general"
+
+    category_text = ", ".join(clean_categories)
+    question = f"I found these categories: {category_text}. Which category do you want to hear?"
+
+    return ask_by_voice(
+        question=question,
+        valid_answers=clean_categories,
+        default_answer=clean_categories[0],
+        preferences=preferences,
+        attempts=3,
+        max_seconds=8,
+    )
+
+
+def ask_summary_or_full(preferences: Optional[Dict] = None):
+    return ask_by_voice(
+        question="Do you want a summary or full text?",
+        valid_answers=["summary", "full"],
+        default_answer="summary",
+        preferences=preferences,
+        attempts=3,
+        max_seconds=8,
+    )
+
+
+def ask_ready_for_next_page(preferences: Optional[Dict] = None):
+    return ask_by_voice(
+        question="Please turn to the next page. Say next when done.",
+        valid_answers=["next"],
+        default_answer="next",
+        preferences=preferences,
+        attempts=3,
+        max_seconds=8,
+    )
+
+
+def ask_tone_preference(preferences: Optional[Dict] = None) -> str:
+    """
+    Ask the user to say natural, friendly, calm, or emotional.
+    Then load mfcc_svm_voice_classifier.joblib to check a short spoken sample.
+    The spoken word is saved even if the SVM guess differs.
+    """
+    selected_tone = ask_by_voice(
+        "Please choose your preferred tone. Say natural, friendly, calm, or emotional.",
+        ["natural", "friendly", "calm", "emotional"],
+        "natural",
+        preferences,
+    )
+
+    if not classifier_ready():
+        return selected_tone
+
+    speak(
+        "Please say: I am ready to listen to my reading, using your selected tone.",
+        preferences,
+    )
+    detected = classify_live_tone(seconds=3.0)
+    if detected and detected == selected_tone:
+        speak(f"{selected_tone} tone confirmed.", preferences)
+    elif detected:
+        print(
+            "MFCC+SVM detected",
+            detected,
+            "but the spoken choice",
+            selected_tone,
+            "will be saved.",
+        )
+
+    return selected_tone
+
+
+def ask_new_preferences(rfid_id: str, is_new_user: bool = True):
+    if is_new_user:
+        speak("New user detected. I will ask your preferences now.")
+    else:
+        speak("Okay. Please provide your preferences again.")
+
+    temp_preferences = {"pace": "normal"}
+
+    reading_level = ask_by_voice(
+        "Please say your reading level. Say very simple, moderate, or light.",
+        ["very simple", "moderate", "light"],
+        "very simple",
+        temp_preferences,
+        max_seconds=10,
+    )
+
+    voice = ask_by_voice(
+        "Please say your voice type. Say male or female.",
+        ["male", "female"],
+        "female",
+        temp_preferences,
+    )
+
+    pace = ask_by_voice(
+        "Please say your reading speed. Say slow, normal, or fast.",
+        ["slow", "normal", "fast"],
+        "normal",
+        temp_preferences,
+    )
+
+    temp_preferences["pace"] = pace
+
+    tone = ask_tone_preference(temp_preferences)
+
+    save_user_preferences(
+        rfid_id=rfid_id,
+        reading_level=reading_level,
+        voice=voice,
+        pace=pace,
+        tone=tone,
+    )
+
+    preferences = {
+        "rfid_id": rfid_id,
+        "reading_level": reading_level,
+        "voice": voice,
+        "voice_type": voice,
+        "pace": pace,
+        "tone": tone,
+    }
+
+    save_current_preferences(preferences)
+    if is_new_user:
+        speak("Your preferences have been saved.", preferences)
+    else:
+        speak("Your preferences have been updated.", preferences)
+    return preferences
+
+
+def get_user_preferences():
+    """
+    RFID + preference flow.
+    Wait for a PN532 card tap on the Pi. Keyboard entry is only a fallback.
+    After the card id, preferences are collected by Rashmi voice input.
+    """
+    init_database()
+
+    print("Loading speech models in the background...")
+    preload = threading.Thread(target=_preload_speech_models, daemon=True)
+    preload.start()
+
+    speak("Hello. Welcome to the Smart Reading Assistant System.")
+    speak("Please tap your RFID card on the right side of the device.")
+
+    rfid_id = read_rfid_uid().strip()
+
+    if not rfid_id:
+        rfid_id = "TEST_RFID_001"
+
+    print("RFID card ID:", rfid_id)
+    preload.join(timeout=60)
+
+    user = find_user(rfid_id)
+
+    if user is None:
+        return ask_new_preferences(rfid_id)
+
+    preferences = _preferences_from_user(user)
+
+    speak("Known RFID card detected.", preferences)
+
+    answer = ask_by_voice(
+        "Do you want to use your previous preferences? Say yes or no.",
+        ["yes", "no"],
+        "yes",
+        preferences,
+    )
+
+    if answer == "yes":
+        save_current_preferences(preferences)
+        speak("Previous preferences loaded.", preferences)
+        return preferences
+
+    return ask_new_preferences(rfid_id, is_new_user=False)
+
+
+def format_abhishek_result_for_speech(result: Dict):
+    """
+    Convert Abhishek JSON result into simple speech text.
+    """
+    document_type = result.get("document_type", "document")
+    title = result.get("title", "")
+    descriptions = result.get("image_descriptions", [])
+
+    lines = ["Page captured.", f"This is a {document_type}."]
+
+    if title and "not clearly" not in str(title).lower() and "handled by" not in str(title).lower():
+        if str(document_type).lower() == "newspaper":
+            lines.append(f"The newspaper name is {title}.")
+        else:
+            lines.append(f"The title is {title}.")
+
+    if descriptions:
+        first_description = descriptions[0]
+        if first_description:
+            lines.append(f"Image description. {first_description}")
+
+    return " ".join(lines)
+
+
+def speak_abhishek_result(result: Dict, preferences: Optional[Dict] = None):
+    speech_text = format_abhishek_result_for_speech(result)
+    speak_reading_text(speech_text, preferences)
+    return speech_text
+
+
+def speak_abhishek_result_from_json(json_path, preferences: Optional[Dict] = None):
+    json_path = Path(json_path)
+
+    if not json_path.exists():
+        print("Result JSON not found:", json_path)
+        speak("Analysis result was not found.", preferences)
+        return None
+
+    with open(json_path, "r", encoding="utf-8") as file:
+        result = json.load(file)
+
+    return speak_abhishek_result(result, preferences)
+
+
+def format_harshaka_result_for_speech(result: Dict):
+    """
+    Harshaka final output should speak the text field.
+    Also supports final_output_text and next_module_payload formats.
+    """
+    if not isinstance(result, dict):
+        return str(result)
+
+    text = (
+        result.get("text")
+        or result.get("final_output_text")
+        or result.get("next_module_payload")
+        or ""
+    )
+
+    if isinstance(text, dict):
+        text = text.get("text", "")
+
+    return str(text).strip()
+
+
+def speak_harshaka_result(result: Dict, preferences: Optional[Dict] = None):
+    speech_text = format_harshaka_result_for_speech(result)
+
+    if not speech_text:
+        speech_text = "No readable content was found."
+
+    speak_reading_text(speech_text, preferences)
+    return speech_text
+
+
+if __name__ == "__main__":
+    prefs = get_user_preferences()
+    speak("Preference test completed.", prefs)

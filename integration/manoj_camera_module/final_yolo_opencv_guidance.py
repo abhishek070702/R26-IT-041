@@ -1,6 +1,8 @@
 import cv2
+import os
 import time
 import json
+import platform
 import subprocess
 import threading
 import queue
@@ -17,8 +19,42 @@ from ultralytics import YOLO
 # PROJECT PATHS
 # ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent.parent if BASE_DIR.parent.name == "integration" else BASE_DIR.parent
+INTEGRATION_DIR = PROJECT_ROOT / "integration"
+if str(INTEGRATION_DIR) not in sys.path:
+    sys.path.insert(0, str(INTEGRATION_DIR))
 
-MODEL_PATH = BASE_DIR / "best.pt"
+try:
+    from rashmi_tts_module.preference_tts import (
+        preferences_from_env,
+        _speak_espeak_or_windows,
+        _speak_via_tts_server,
+    )
+except Exception:
+    _speak_espeak_or_windows = None
+    _speak_via_tts_server = None
+    preferences_from_env = None
+
+
+def resolve_model_path() -> Path:
+    env_path = os.getenv("YOLO_MODEL_PATH", "").strip()
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(
+        [
+            BASE_DIR / "best.pt",
+            PROJECT_ROOT / "manoj_camera_module" / "best.pt",
+            BASE_DIR.parent / "manoj_camera_module" / "best.pt",
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0] if candidates else BASE_DIR / "best.pt"
+
+
+MODEL_PATH = resolve_model_path()
 CONFIG_PATH = BASE_DIR / "guidance_config.json"
 CAPTURE_DIR = BASE_DIR / "captured_pages"
 
@@ -27,11 +63,20 @@ CAPTURE_DIR.mkdir(exist_ok=True)
 
 # ==========================================================
 # CAMERA SETTINGS
+# USB webcam on Raspberry Pi: CAMERA_INDEX=0 or 1
+# Do not import picamera2 (that is Pi Camera Module 3 only).
+# Pi defaults stay small so YOLO does not freeze after open.
 # ==========================================================
-CAMERA_INDEX = 0
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
-CAMERA_FPS = 30
+_IS_LINUX = platform.system().lower() != "windows"
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+FRAME_WIDTH = int(os.getenv("CAMERA_WIDTH", "640" if _IS_LINUX else "1280"))
+FRAME_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480" if _IS_LINUX else "720"))
+CAMERA_FPS = int(os.getenv("CAMERA_FPS", "15" if _IS_LINUX else "30"))
+CAMERA_FLIP = os.getenv(
+    "CAMERA_FLIP",
+    "0" if _IS_LINUX else "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+PREVIEW_MAX_WIDTH = int(os.getenv("PREVIEW_MAX_WIDTH", "640"))
 
 
 # ==========================================================
@@ -39,7 +84,8 @@ CAMERA_FPS = 30
 # ==========================================================
 YOLO_CONFIDENCE = 0.25
 YOLO_FALLBACK_CONFIDENCE = 0.12
-YOLO_IMAGE_SIZE = 640
+YOLO_IMAGE_SIZE = int(os.getenv("YOLO_IMAGE_SIZE", "320" if _IS_LINUX else "640"))
+YOLO_SKIP_FRAMES = int(os.getenv("YOLO_SKIP_FRAMES", "2" if _IS_LINUX else "0"))
 PAGE_CLASS_NAME = "page"
 MIN_PAGE_AREA_RATIO = 0.01
 MAX_PAGE_AREA_RATIO = 0.99
@@ -60,18 +106,23 @@ RUN_NEXT_MODULE_AUTOMATICALLY = True
 # GUIDANCE CONFIG
 # ==========================================================
 DEFAULT_CONFIG = {
-    # Press C when page is perfect. This value will update automatically.
-    "target_area_ratio": 0.45,
+    # Typical full-page fill in the camera frame
+    "target_area_ratio": 0.42,
 
-    # 0.20 means 20% size difference allowed
-    "distance_tolerance": 0.20,
+    # 0.25 means 25% size difference allowed
+    "distance_tolerance": 0.25,
 
     # Center tolerance
-    "center_tolerance_x": 0.08,
-    "center_tolerance_y": 0.08,
+    "center_tolerance_x": 0.12,
+    "center_tolerance_y": 0.12,
 
-    # Page should not touch frame borders
-    "edge_margin": 0.03,
+    # Full page must sit inside the frame with this margin
+    "edge_margin": 0.04,
+
+    # Do not capture a tiny distant page
+    "min_full_page_area": 0.28,
+    "min_width_fill": 0.28,
+    "min_height_fill": 0.42,
 
     # Detection quality
     "minimum_confidence": 0.25
@@ -81,89 +132,113 @@ DEFAULT_CONFIG = {
 # ==========================================================
 # AUTO CAPTURE SETTINGS
 # ==========================================================
-READY_STABLE_FRAMES = 18
+READY_STABLE_FRAMES = int(os.getenv("READY_STABLE_FRAMES", "8" if _IS_LINUX else "18"))
+READY_HOLD_SECONDS = float(os.getenv("READY_HOLD_SECONDS", "2.0"))
+NO_PAGE_ANNOUNCE_SECONDS = float(os.getenv("NO_PAGE_ANNOUNCE_SECONDS", "1.0"))
+READY_MISS_TOLERANCE = int(os.getenv("READY_MISS_TOLERANCE", "5"))
 CAPTURE_COOLDOWN_SECONDS = 8
 
 CROP_MARGIN_RATIO = 0.10
 
-VOICE_COOLDOWN_SECONDS = 2.5
-STABILITY_WINDOW = 8
-STABILITY_REQUIRED = 5
+STABILITY_WINDOW = 6
+STABILITY_REQUIRED = 4
 
 
 # ==========================================================
 # VOICE SYSTEM
 # ==========================================================
 class VoiceSystem:
-    def __init__(self):
-        self.voice_queue = queue.Queue(maxsize=1)
-        self.last_text = ""
-        self.last_time = 0
+    """
+    One speaker only. Each instruction finishes before the next starts.
+    The camera loop never talks on the main thread, so guidance cannot overlap.
+    """
 
+    _playback_lock = threading.Lock()
+
+    def __init__(self):
+        self.voice_queue = queue.Queue()
+        self._speaking = False
+        self._pending = 0
+        self._lock = threading.Lock()
+        self.last_text = ""
         self.worker_thread = threading.Thread(
             target=self._worker,
             daemon=True
         )
         self.worker_thread.start()
 
-    def _speak_windows(self, text):
-        safe_text = text.replace("'", "''")
+    def _speak_text(self, text):
+        # Laptop TTS server first. Never call OpenAI from the camera loop.
+        prefs = preferences_from_env() if preferences_from_env else None
 
-        command = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$speaker.Rate = 0; "
-            "$speaker.Volume = 100; "
-            f"$speaker.Speak('{safe_text}');"
-        )
+        with VoiceSystem._playback_lock:
+            spoken = False
+            if _speak_via_tts_server is not None:
+                spoken = bool(_speak_via_tts_server(text, prefs))
+            if not spoken and _speak_espeak_or_windows is not None:
+                try:
+                    _speak_espeak_or_windows(text, prefs)
+                    spoken = True
+                except Exception as error:
+                    print("Local camera voice failed:", error)
+            if not spoken:
+                voice = os.getenv("RASHMI_VOICE", "female").strip().lower()
+                pace = os.getenv("RASHMI_PACE", "normal").strip().lower()
+                espeak_voice = "en+m3" if voice == "male" else "en+f3"
+                pitch = "35" if voice == "male" else "72"
+                speed = "140"
+                if pace == "slow":
+                    speed = "115"
+                elif pace == "fast":
+                    speed = "170"
+                binary = "espeak-ng"
+                subprocess.run(
+                    [binary, "-v", espeak_voice, "-s", speed, "-p", pitch, str(text)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            # Speaker buffers can keep playing after the process exits.
+            # Wait so the next cue cannot cut off the last words.
+            pause = 0.35 + (0.06 * max(1, len(str(text).split())))
+            time.sleep(min(pause, 1.2))
 
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+    def is_busy(self):
+        with self._lock:
+            return self._speaking or self._pending > 0 or not self.voice_queue.empty()
+
+    def say(self, text, force=False):
+        text = str(text or "").strip()
+        if not text:
+            return
+
+        # force=True queues behind the current line. It never speaks in parallel.
+        with self._lock:
+            busy = self._speaking or self._pending > 0 or not self.voice_queue.empty()
+            if not force and busy:
+                return
+            self._pending += 1
+            self.last_text = text
+
+        print("VOICE:", text)
+        self.voice_queue.put(text)
 
     def _worker(self):
         while True:
             text = self.voice_queue.get()
-
             if text is None:
                 break
 
+            with self._lock:
+                self._speaking = True
             try:
-                self._speak_windows(text)
+                self._speak_text(text)
             except Exception as error:
                 print("Voice error:", error)
-
-    def say(self, text):
-        current_time = time.time()
-
-        if text == self.last_text and current_time - self.last_time < VOICE_COOLDOWN_SECONDS:
-            return
-
-        if current_time - self.last_time < VOICE_COOLDOWN_SECONDS:
-            return
-
-        while not self.voice_queue.empty():
-            try:
-                self.voice_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        try:
-            self.voice_queue.put_nowait(text)
-            self.last_text = text
-            self.last_time = current_time
-            print("VOICE:", text)
-        except queue.Full:
-            pass
+            finally:
+                with self._lock:
+                    self._speaking = False
+                    self._pending = max(0, self._pending - 1)
 
 
 # ==========================================================
@@ -207,22 +282,66 @@ def calibrate_correct_position(config, metrics):
 # ==========================================================
 # CAMERA FUNCTION
 # ==========================================================
-def open_camera(camera_index):
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera_index)
-
+def _configure_capture(cap):
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-
-    # Warm up the camera — first frames are often dark or out of focus.
-    for _ in range(15):
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # USB webcams blur if autofocus is forced off.
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, int(os.getenv("CAMERA_AUTOFOCUS", "1")))
+    for _ in range(3):
         cap.read()
-
+    print(
+        "Camera configured:",
+        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "x",
+        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "yolo_imgsz",
+        YOLO_IMAGE_SIZE,
+        "skip",
+        YOLO_SKIP_FRAMES,
+    )
     return cap
+
+
+def open_camera(camera_index):
+    """
+    USB webcam via OpenCV.
+    Windows: DirectShow. Raspberry Pi / Linux: V4L2 (/dev/video0, video1, ...).
+    """
+    camera_index = int(os.getenv("CAMERA_INDEX", camera_index))
+    system_name = platform.system().lower()
+    print("Opening USB camera index:", camera_index)
+
+    cap = None
+
+    if "windows" in system_name:
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+    else:
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+
+        if not cap.isOpened():
+            for fallback_index in range(0, 5):
+                if fallback_index == camera_index:
+                    continue
+                print("Trying USB camera index:", fallback_index)
+                cap = cv2.VideoCapture(fallback_index, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    print("Opened USB camera index:", fallback_index)
+                    break
+
+    if cap is None or not cap.isOpened():
+        print("ERROR: USB camera not opened.")
+        print("On Pi run: ls /dev/video*")
+        print("Then retry with: export CAMERA_INDEX=1")
+        return cap
+
+    return _configure_capture(cap)
 
 
 # ==========================================================
@@ -257,7 +376,6 @@ def _pick_best_page_box(result, frame_width, frame_height, model_names):
                 continue
 
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-
         x1 = max(0, min(x1, frame_width - 1))
         y1 = max(0, min(y1, frame_height - 1))
         x2 = max(0, min(x2, frame_width - 1))
@@ -288,13 +406,18 @@ def _pick_best_page_box(result, frame_width, frame_height, model_names):
 
 def detect_page_with_yolo(model, frame, model_names):
     frame_height, frame_width = frame.shape[:2]
+    confidences = (YOLO_CONFIDENCE,) if _IS_LINUX else (
+        YOLO_CONFIDENCE,
+        YOLO_FALLBACK_CONFIDENCE,
+    )
 
-    for confidence in (YOLO_CONFIDENCE, YOLO_FALLBACK_CONFIDENCE):
-        results = model(
+    for confidence in confidences:
+        results = model.predict(
             frame,
             imgsz=YOLO_IMAGE_SIZE,
             conf=confidence,
-            verbose=False
+            verbose=False,
+            max_det=1,
         )
 
         detection = _pick_best_page_box(
@@ -355,10 +478,14 @@ def calculate_metrics(detection, frame_width, frame_height):
 # GUIDANCE DECISION
 # ==========================================================
 def decide_guidance(detection, metrics, config):
+    """
+    Speak how to get the whole page in view.
+    Capture is allowed only when the full page is inside the frame.
+    """
     confidence = detection["confidence"]
 
     if confidence < config["minimum_confidence"]:
-        return "Show the page clearly", False
+        return "Show the full page clearly", False
 
     offset_x = metrics["offset_x"]
     offset_y = metrics["offset_y"]
@@ -366,48 +493,60 @@ def decide_guidance(detection, metrics, config):
 
     target_area = config["target_area_ratio"]
     distance_tolerance = config["distance_tolerance"]
-
     center_tolerance_x = config["center_tolerance_x"]
     center_tolerance_y = config["center_tolerance_y"]
-
     edge_margin = config["edge_margin"]
+    min_area = config.get("min_full_page_area", 0.28)
+    min_width = config.get("min_width_fill", 0.28)
+    min_height = config.get("min_height_fill", 0.42)
 
-    too_small_area = target_area * (1 - distance_tolerance)
-    too_large_area = target_area * (1 + distance_tolerance)
+    too_small_area = max(min_area, target_area * (1 - distance_tolerance))
+    too_large_area = min(0.85, target_area * (1 + distance_tolerance))
 
-    page_touches_edge = (
-        metrics["edge_left"] < edge_margin or
-        metrics["edge_right"] < edge_margin or
-        metrics["edge_top"] < edge_margin or
-        metrics["edge_bottom"] < edge_margin
-    )
+    clipped = []
+    if metrics["edge_left"] < edge_margin:
+        clipped.append("left")
+    if metrics["edge_right"] < edge_margin:
+        clipped.append("right")
+    if metrics["edge_top"] < edge_margin:
+        clipped.append("top")
+    if metrics["edge_bottom"] < edge_margin:
+        clipped.append("bottom")
 
-    # 1. If page is cut by border, move farther first
-    if page_touches_edge and area_ratio > target_area * 0.85:
-        return "Move farther", False
+    # Partial page: never capture until every edge is inside the frame
+    if clipped:
+        if len(clipped) >= 2 or area_ratio > target_area:
+            return "Move farther so the full page fits", False
+        if clipped == ["left"]:
+            return "Move right. The left side is cut off", False
+        if clipped == ["right"]:
+            return "Move left. The right side is cut off", False
+        if clipped == ["top"]:
+            return "Move down. The top of the page is cut off", False
+        if clipped == ["bottom"]:
+            return "Move up. The bottom of the page is cut off", False
+        return "Move farther so the full page fits", False
 
-    # 2. Center correction
     if offset_x < -center_tolerance_x:
-        return "Move camera left", False
-
+        return "Move left to center the page", False
     if offset_x > center_tolerance_x:
-        return "Move camera right", False
-
+        return "Move right to center the page", False
     if offset_y < -center_tolerance_y:
-        return "Move camera up", False
-
+        return "Move up to center the page", False
     if offset_y > center_tolerance_y:
-        return "Move camera down", False
+        return "Move down to center the page", False
 
-    # 3. Distance correction
-    if area_ratio < too_small_area:
-        return "Move closer", False
+    if (
+        area_ratio < too_small_area
+        or metrics["width_fill"] < min_width
+        or metrics["height_fill"] < min_height
+    ):
+        return "Move closer until the full page is visible", False
 
     if area_ratio > too_large_area:
-        return "Move farther", False
+        return "Move farther so the full page fits", False
 
-    # 4. Perfect
-    return "Ready. Hold steady", True
+    return "Full page visible. Hold still", True
 
 
 # ==========================================================
@@ -491,13 +630,15 @@ def send_to_next_module(image_path):
     print("Sending image to next module:", next_module_path)
 
     try:
-        subprocess.Popen(
+        subprocess.run(
             [
                 sys.executable,
                 str(next_module_path),
                 str(image_path)
             ],
-            cwd=str(BASE_DIR)
+            cwd=str(BASE_DIR),
+            check=False,
+            timeout=200,
         )
     except Exception as error:
         print("Error sending image to next module:", error)
@@ -506,13 +647,13 @@ def send_to_next_module(image_path):
 # ==========================================================
 # DRAW UI
 # ==========================================================
-def draw_ui(frame, detection, metrics, instruction, ready_count, config):
+def draw_ui(frame, detection, metrics, instruction, ready_count, config, ready_hold_seconds=0.0):
     frame_height, frame_width = frame.shape[:2]
 
     # Top black background
     cv2.rectangle(frame, (0, 0), (frame_width, 100), (0, 0, 0), -1)
 
-    color = (0, 255, 0) if "Ready" in instruction else (0, 0, 255)
+    color = (0, 255, 0) if "full page visible" in instruction.lower() else (0, 0, 255)
 
     cv2.putText(
         frame,
@@ -586,7 +727,7 @@ def draw_ui(frame, detection, metrics, instruction, ready_count, config):
             f'Offset Y: {metrics["offset_y"]:.3f}',
             f'Width Fill: {metrics["width_fill"]:.3f}',
             f'Height Fill: {metrics["height_fill"]:.3f}',
-            f'Ready Frames: {ready_count}/{READY_STABLE_FRAMES}',
+            f'Hold: {ready_hold_seconds:.1f}/{READY_HOLD_SECONDS:.1f}s',
         ]
     else:
         debug_lines = [
@@ -631,6 +772,17 @@ def draw_ui(frame, detection, metrics, instruction, ready_count, config):
     return frame
 
 
+def preview_enabled() -> bool:
+    flag = os.getenv("CAMERA_PREVIEW", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if _IS_LINUX:
+        return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+    return True
+
+
 # ==========================================================
 # MAIN FUNCTION
 # ==========================================================
@@ -641,60 +793,106 @@ def main():
 
     if not MODEL_PATH.exists():
         print("ERROR: best.pt not found.")
-        print("Put best.pt in the same folder as this Python file.")
+        print("Looked for:", MODEL_PATH)
+        print("Expected on the Pi: /home/readingassistant/R26-IT-041/manoj_camera_module/best.pt")
+        print("Or set YOLO_MODEL_PATH to the full path of best.pt.")
         return
 
     config = load_config()
 
     print("Loading YOLO model:", MODEL_PATH)
-    model = YOLO(str(MODEL_PATH))
+    print("This can take 10 to 30 seconds on Raspberry Pi. Please wait.")
+    t_load = time.perf_counter()
+    model = YOLO(str(MODEL_PATH), task="detect")
     model_names = model.names
+    print(f"YOLO model loaded in {time.perf_counter() - t_load:.1f}s")
 
     print("Model classes:", model_names)
+    dummy = np.zeros((YOLO_IMAGE_SIZE, YOLO_IMAGE_SIZE, 3), dtype=np.uint8)
+    model.predict(dummy, imgsz=YOLO_IMAGE_SIZE, verbose=False)
+    print("YOLO warmup done.")
 
     print("Opening camera index:", CAMERA_INDEX)
     cap = open_camera(CAMERA_INDEX)
 
-    if not cap.isOpened():
-        print("ERROR: Camera not opened.")
-        print("Try CAMERA_INDEX = 1 or 2.")
+    if cap is None or not cap.isOpened():
+        print("ERROR: USB camera not opened.")
+        print("Unplug Pi Camera Module 3 ribbon if you switched to USB.")
+        print("Run: ls /dev/video*")
+        print("Then: export CAMERA_INDEX=0   or   export CAMERA_INDEX=1")
         return
 
+    show_preview = preview_enabled()
+    print("Camera opened. Guidance loop starting. Preview:", show_preview)
+
     voice = VoiceSystem()
-    voice.say("Camera guidance started")
+    voice.say(
+        "Point the camera at the page. I will guide you until the full page is visible."
+    )
 
     voice_history = deque(maxlen=STABILITY_WINDOW)
 
     ready_count = 0
+    ready_since = None
+    ready_miss_count = 0
+    no_page_since = None
     last_capture_time = 0
+    session_has_captured = False
+    last_logged_instruction = ""
+    last_log_time = 0
+    last_detection = None
+    hold_announced = False
+    frame_index = 0
+    single_capture = os.getenv("SINGLE_CAPTURE", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     while True:
+        cap.grab()
         ret, frame = cap.read()
 
         if not ret:
             print("Cannot read camera frame.")
             break
 
-        frame = cv2.flip(frame, 1)
+        if CAMERA_FLIP:
+            frame = cv2.flip(frame, 1)
 
-        # Keep clean frame for saving
         clean_frame = frame.copy()
 
         frame_height, frame_width = frame.shape[:2]
-
-        detection = detect_page_with_yolo(
-            model,
-            frame,
-            model_names
+        frame_index += 1
+        run_yolo = YOLO_SKIP_FRAMES <= 0 or (
+            frame_index % (YOLO_SKIP_FRAMES + 1) == 0
         )
+
+        if run_yolo:
+            last_detection = detect_page_with_yolo(
+                model,
+                frame,
+                model_names
+            )
+
+        detection = last_detection
+        current_time = time.time()
 
         if detection is None:
             metrics = None
             instruction = "No page detected"
             is_ready = False
-            ready_count = 0
+            hold_announced = False
+            ready_miss_count += 1
+            if ready_miss_count >= READY_MISS_TOLERANCE:
+                ready_count = 0
+                ready_since = None
+            if no_page_since is None:
+                no_page_since = current_time
 
         else:
+            no_page_since = None
             metrics = calculate_metrics(
                 detection,
                 frame_width,
@@ -708,38 +906,61 @@ def main():
             )
 
             if is_ready:
+                ready_miss_count = 0
                 ready_count += 1
+                if ready_since is None:
+                    ready_since = current_time
             else:
-                ready_count = 0
+                hold_announced = False
+                ready_miss_count += 1
+                if ready_miss_count >= READY_MISS_TOLERANCE:
+                    ready_count = 0
+                    ready_since = None
 
-            print(
-                f'Conf: {detection["confidence"]:.2f} | '
-                f'Area: {metrics["area_ratio"]:.3f} | '
-                f'Target: {config["target_area_ratio"]:.3f} | '
-                f'X: {metrics["offset_x"]:.3f} | '
-                f'Y: {metrics["offset_y"]:.3f} | '
-                f'Ready: {ready_count}/{READY_STABLE_FRAMES} | '
-                f'Guide: {instruction}'
-            )
+            hold_seconds = (current_time - ready_since) if ready_since else 0.0
+            if instruction != last_logged_instruction or current_time - last_log_time > 2.0:
+                print(
+                    f'Hold: {hold_seconds:.1f}/{READY_HOLD_SECONDS:.1f}s | '
+                    f'Guide: {instruction}'
+                )
+                last_logged_instruction = instruction
+                last_log_time = current_time
 
-        stable_text = get_stable_voice_text(
-            voice_history,
-            instruction
+        # Repeat guidance until the page is fully visible.
+        # Speak only when the previous instruction has finished.
+        if not is_ready:
+            should_speak = True
+            if instruction == "No page detected":
+                should_speak = (
+                    no_page_since is not None
+                    and current_time - no_page_since >= NO_PAGE_ANNOUNCE_SECONDS
+                )
+            else:
+                stable_text = get_stable_voice_text(voice_history, instruction)
+                should_speak = stable_text is not None
+                if should_speak:
+                    instruction = stable_text
+
+            if should_speak and not voice.is_busy():
+                voice.say(instruction)
+        elif not hold_announced and not voice.is_busy():
+            voice.say("Full page visible. Hold still.")
+            hold_announced = True
+
+        hold_seconds = (current_time - ready_since) if ready_since else 0.0
+        cooldown_ok = (
+            not session_has_captured
+            or current_time - last_capture_time > CAPTURE_COOLDOWN_SECONDS
         )
-
-        if stable_text is not None:
-            voice.say(stable_text)
-
-        # Auto capture when page is ready for enough frames
-        current_time = time.time()
 
         if (
             detection is not None and
             is_ready and
-            ready_count >= READY_STABLE_FRAMES and
-            current_time - last_capture_time > CAPTURE_COOLDOWN_SECONDS
+            ready_since is not None and
+            hold_seconds >= READY_HOLD_SECONDS and
+            cooldown_ok
         ):
-            voice.say("Capturing page")
+            voice.say("Capturing now.", force=True)
 
             captured_image_path = save_capture(
                 clean_frame,
@@ -748,26 +969,46 @@ def main():
 
             send_to_next_module(captured_image_path)
 
-            voice.say("Page captured successfully")
+            voice.say("Page captured successfully.", force=True)
 
             last_capture_time = current_time
+            session_has_captured = True
             ready_count = 0
+            ready_since = None
+            hold_announced = False
 
-        display_frame = draw_ui(
-            frame,
-            detection,
-            metrics,
-            instruction,
-            ready_count,
-            config
-        )
+            if single_capture:
+                print("Single capture done. Closing camera.")
+                break
 
-        cv2.imshow(
-            "YOLO Page Guidance + Auto Capture",
-            display_frame
-        )
+        if show_preview:
+            display_frame = draw_ui(
+                frame,
+                detection,
+                metrics,
+                instruction,
+                ready_count,
+                config,
+                ready_hold_seconds=hold_seconds,
+            )
 
-        key = cv2.waitKey(1) & 0xFF
+            if display_frame.shape[1] > PREVIEW_MAX_WIDTH:
+                scale = PREVIEW_MAX_WIDTH / float(display_frame.shape[1])
+                display_frame = cv2.resize(
+                    display_frame,
+                    (
+                        PREVIEW_MAX_WIDTH,
+                        max(1, int(display_frame.shape[0] * scale)),
+                    ),
+                )
+
+            cv2.imshow(
+                "YOLO Page Guidance + Auto Capture",
+                display_frame
+            )
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = 0
 
         if key == ord("q"):
             break
@@ -784,7 +1025,8 @@ def main():
                 voice.say("No page detected")
 
     cap.release()
-    cv2.destroyAllWindows()
+    if show_preview:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

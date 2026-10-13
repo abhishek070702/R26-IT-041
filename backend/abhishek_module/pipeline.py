@@ -1570,12 +1570,116 @@ def analyze_page(image_path: str) -> dict:
         return result
 
 
+def _format_image_only_context_caption(
+    raw_caption: str,
+    context: str,
+    cleaned_fallback: str = "",
+) -> tuple[str, bool]:
+    """Apply page-illustration context wording to a local raw caption."""
+    if _format_florence_context_caption is not None:
+        try:
+            description, has_image = _format_florence_context_caption(
+                raw_caption,
+                context=context,
+            )
+            description = str(description or "").strip()
+            has_image = bool(has_image) and bool(description)
+            return description, has_image
+        except Exception:
+            logger.exception("Context caption formatting failed")
+
+    description = str(cleaned_fallback or raw_caption or "").strip()
+    return description, bool(description)
+
+
+def _run_local_image_only_caption(
+    process_path: str,
+    context: str,
+) -> tuple[str, str, bool, str]:
+    """
+    Run the configured local caption model for /describe-image.
+
+    Honors IMAGE_DESCRIPTION_MODEL so BLIP sessions do not also load Florence
+    onto the GPU (which can OOM-kill the backend after /abhishek/analyze).
+
+    Returns:
+        (raw_caption, description, has_image, local_source)
+    """
+    selected = _selected_image_description_model()
+    print(f"[image_description] image_description_model={selected}")
+    logger.info("describe_image_only model=%s", selected)
+
+    raw = ""
+    cleaned_fallback = ""
+    local_source = selected
+
+    if selected == "florence":
+        if _describe_image_florence is None:
+            print("[image_description] Florence unavailable; falling back to BLIP")
+            local_source = "blip"
+        else:
+            try:
+                florence_meta = _describe_image_florence(
+                    process_path,
+                    document_type="",
+                )
+                if florence_meta and isinstance(florence_meta, dict):
+                    raw = str(
+                        florence_meta.get("florence_raw_caption") or ""
+                    ).strip()
+                    cleaned_fallback = str(
+                        florence_meta.get("florence_cleaned_caption") or ""
+                    ).strip()
+                    print(f"[pipeline] florence_raw_caption={raw!r}")
+                    local_source = "florence"
+                else:
+                    print(
+                        "[image_description] Florence returned empty; "
+                        "falling back to BLIP"
+                    )
+                    local_source = "blip"
+            except Exception as exc:
+                logger.exception(
+                    "Florence image-only description failed path=%r",
+                    process_path,
+                )
+                print(f"[image_description] florence error: {exc}")
+                print("[image_description] Florence failed; falling back to BLIP")
+                local_source = "blip"
+
+    if local_source == "blip" or (selected == "florence" and not raw):
+        try:
+            captions = _run_blip_description(process_path)
+            raw = str(captions[0]).strip() if captions else ""
+            cleaned_fallback = raw
+            local_source = "blip"
+            print(f"[pipeline] blip_raw_caption={raw!r}")
+            print("[image_description] description_source=blip")
+        except Exception as exc:
+            logger.exception(
+                "BLIP image-only description failed path=%r",
+                process_path,
+            )
+            print(f"[image_description] blip error: {exc}")
+            raw = ""
+            cleaned_fallback = ""
+            local_source = "blip"
+
+    description, has_image = _format_image_only_context_caption(
+        raw,
+        context=context,
+        cleaned_fallback=cleaned_fallback,
+    )
+    return raw, description, has_image, local_source
+
+
 def describe_image_only(image_path: str, context: str = "general") -> dict:
     """
     Reusable image description for page illustrations / article photos.
 
-    Local Florence still runs as backup. When USE_OPENAI_FALLBACK=true, OpenAI
-    Vision is given the page-illustration task and its caption is preferred.
+    Uses IMAGE_DESCRIPTION_MODEL for the local caption (blip or florence).
+    When USE_OPENAI_FALLBACK=true, OpenAI Vision is preferred for the final
+    page-illustration caption.
 
     Does not run document classification or title reading.
     """
@@ -1611,7 +1715,7 @@ def describe_image_only(image_path: str, context: str = "general") -> dict:
         print("[image_description] final_description=")
         return empty
 
-    # Optional resize for stable Florence inference (no full-page crop/classify).
+    # Optional resize for stable local inference (no full-page crop/classify).
     process_path = image_path
     if _optimize_processing_image is not None:
         try:
@@ -1620,64 +1724,18 @@ def describe_image_only(image_path: str, context: str = "general") -> dict:
             logger.exception("optimize_processing_image failed for image-only path")
             process_path = image_path
 
-    if _describe_image_florence is None:
+    if _describe_image_local is None and _describe_image_florence is None:
         warnings.append("Image description failed")
         empty["warnings"] = warnings
         print("[image_description] has_image=false")
         print("[image_description] final_description=")
         return empty
 
-    try:
-        # Florence raw caption only; context formatting applied separately so
-        # /abhishek/analyze document-type wording stays unchanged.
-        florence_meta = _describe_image_florence(process_path, document_type="")
-    except Exception as exc:
-        logger.exception("Florence image-only description failed path=%r", process_path)
-        warnings.append("Image description failed")
-        print(f"[image_description] florence error: {exc}")
-        print("[image_description] has_image=false")
-        print("[image_description] final_description=")
-        return {
-            "has_image": False,
-            "image_description": "",
-            "context": normalized_context,
-            "status": "failed",
-            "warnings": warnings,
-        }
-
-    if not florence_meta or not isinstance(florence_meta, dict):
-        warnings.append("Image description failed")
-        print("[image_description] has_image=false")
-        print("[image_description] final_description=")
-        return {
-            "has_image": False,
-            "image_description": "",
-            "context": normalized_context,
-            "status": "failed",
-            "warnings": warnings,
-        }
-
-    raw = str(florence_meta.get("florence_raw_caption") or "").strip()
-    print(f"[pipeline] florence_raw_caption={raw!r}")
-
-    description = ""
-    has_image = False
-    if _format_florence_context_caption is not None:
-        try:
-            description, has_image = _format_florence_context_caption(
-                raw,
-                context=normalized_context,
-            )
-            description = str(description or "").strip()
-            has_image = bool(has_image) and bool(description)
-        except Exception:
-            logger.exception("Florence context caption formatting failed")
-            description = ""
-            has_image = False
-    else:
-        # Extreme fallback if helper missing: use cleaned Florence caption as-is.
-        description = str(florence_meta.get("florence_cleaned_caption") or "").strip()
-        has_image = bool(description)
+    raw, description, has_image, local_source = _run_local_image_only_caption(
+        process_path,
+        normalized_context,
+    )
+    print(f"[image_description] local_source={local_source}")
 
     no_image_markers = (
         "no important visual image is detected",
@@ -1739,7 +1797,9 @@ def describe_image_only(image_path: str, context: str = "general") -> dict:
             else:
                 print("[image_description] OpenAI failed; keeping local result")
     else:
-        print("[image_description] OpenAI skipped (disabled); using Florence")
+        print(
+            f"[image_description] OpenAI skipped (disabled); using {local_source}"
+        )
 
     if openai_used:
         if not description or _is_camera_background_description(description):

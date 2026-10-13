@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 _paddle_ocr = None
 _paddle_load_error: str | None = None
+_PADDLE_LOCK = threading.Lock()
 
 MAGAZINE_MASTHEAD_TOKENS = {
     "TIME",
@@ -86,51 +88,57 @@ def _load_paddleocr():
     """
     global _paddle_ocr, _paddle_load_error
 
-    if _paddle_ocr is not None:
-        return _paddle_ocr
+    with _PADDLE_LOCK:
+        if _paddle_ocr is not None:
+            return _paddle_ocr
 
-    try:
-        from paddleocr import PaddleOCR
+        try:
+            from paddleocr import PaddleOCR
 
-        version = _paddleocr_version()
-        print(f"[title_reader] PaddleOCR version={version}")
-        logger.info("PaddleOCR version=%s", version)
+            version = _paddleocr_version()
+            print(f"[title_reader] PaddleOCR version={version}")
+            logger.info("PaddleOCR version=%s", version)
 
-        init_attempts = (
-            ("v3_device_cpu", {"lang": "en", "device": "cpu"}),
-            ("v3_device_cpu_minimal", {"device": "cpu"}),
-        )
+            init_attempts = (
+                ("v3_device_cpu", {"lang": "en", "device": "cpu"}),
+                ("v3_device_cpu_minimal", {"device": "cpu"}),
+            )
 
-        last_error: Exception | None = None
-        for mode, kwargs in init_attempts:
-            try:
-                print(f"[title_reader] PaddleOCR init mode={mode}")
-                logger.info("PaddleOCR init mode=%s kwargs=%s", mode, kwargs)
-                _paddle_ocr = PaddleOCR(**kwargs)
-                print("[title_reader] PaddleOCR loaded successfully")
-                logger.info("PaddleOCR loaded successfully mode=%s", mode)
-                _paddle_load_error = None
-                return _paddle_ocr
-            except Exception as exc:
-                last_error = exc
-                print(
-                    f"[title_reader] PaddleOCR init mode={mode} failed: {exc}"
-                )
-                logger.warning(
-                    "PaddleOCR init mode=%s failed: %s",
-                    mode,
-                    exc,
-                )
+            last_error: Exception | None = None
+            for mode, kwargs in init_attempts:
+                try:
+                    print(f"[title_reader] PaddleOCR init mode={mode}")
+                    logger.info("PaddleOCR init mode=%s kwargs=%s", mode, kwargs)
+                    _paddle_ocr = PaddleOCR(**kwargs)
+                    print("[title_reader] PaddleOCR loaded successfully")
+                    logger.info("PaddleOCR loaded successfully mode=%s", mode)
+                    _paddle_load_error = None
+                    return _paddle_ocr
+                except Exception as exc:
+                    last_error = exc
+                    print(
+                        f"[title_reader] PaddleOCR init mode={mode} failed: {exc}"
+                    )
+                    logger.warning(
+                        "PaddleOCR init mode=%s failed: %s",
+                        mode,
+                        exc,
+                    )
 
-        raise RuntimeError(
-            f"Failed to load PaddleOCR with compatible CPU settings: {last_error}"
-        )
-    except Exception as exc:
-        _paddle_ocr = None
-        _paddle_load_error = f"Failed to load PaddleOCR: {exc}"
-        print(f"[title_reader] PaddleOCR load failed: {_paddle_load_error}")
-        logger.exception("PaddleOCR load failed")
-        raise RuntimeError(_paddle_load_error) from exc
+            raise RuntimeError(
+                f"Failed to load PaddleOCR with compatible CPU settings: {last_error}"
+            )
+        except Exception as exc:
+            _paddle_ocr = None
+            _paddle_load_error = f"Failed to load PaddleOCR: {exc}"
+            print(f"[title_reader] PaddleOCR load failed: {_paddle_load_error}")
+            logger.exception("PaddleOCR load failed")
+            raise RuntimeError(_paddle_load_error) from exc
+
+
+def preload_paddleocr() -> None:
+    """Warm the PaddleOCR cache using the existing loader."""
+    _load_paddleocr()
 
 
 def _run_paddle_ocr(image_np: np.ndarray) -> list[Any]:

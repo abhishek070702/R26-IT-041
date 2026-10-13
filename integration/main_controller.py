@@ -2,10 +2,24 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
+
+_THREAD_HTTP = threading.local()
+_HTTP_TIMEOUT = (5, 180)
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_THREAD_HTTP, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_HTTP.session = session
+    return session
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -217,73 +231,102 @@ def first_cover_description(abhishek_result: Dict) -> str:
     return ""
 
 
-def speak_first_page(abhishek_result: Dict, document_type: str, preferences: Dict):
+def speak_first_page(
+    abhishek_result: Dict,
+    document_type: str,
+    preferences: Dict,
+    since_capture: Optional[float] = None,
+):
+    """
+    Speak type/title first so the user hears useful audio immediately,
+    then the cover description (same content, progressive delivery).
+    """
     title = abhishek_result.get("title")
     cover_description = first_cover_description(abhishek_result)
+    mark = since_capture if since_capture is not None else time.perf_counter()
+
+    def _log_first_audio(stage: str) -> None:
+        print(
+            "[controller] timing capture_to_first_audio="
+            f"{time.perf_counter() - mark:.2f}s stage={stage}"
+        )
 
     if document_type == "Novel":
         parts = ["This is a Novel."]
         if is_usable_title(title):
             parts.append(f"The title is {title}.")
-        if cover_description:
-            parts.append(cover_description)
+        _log_first_audio("first_page_title_start")
         speak_reading_text(" ".join(parts), preferences)
+        if cover_description:
+            speak_reading_text(cover_description, preferences)
         return
 
     if document_type == "Magazine":
         parts = ["This is a Magazine."]
         if is_usable_title(title):
             parts.append(f"The title is {title}.")
-        if cover_description:
-            parts.append(cover_description)
+        _log_first_audio("first_page_title_start")
         speak_reading_text(" ".join(parts), preferences)
+        if cover_description:
+            speak_reading_text(cover_description, preferences)
         return
 
     if document_type == "Newspaper":
         parts = ["This is a Newspaper."]
         if is_usable_title(title):
             parts.append(f"The newspaper name is {title}.")
+        _log_first_audio("first_page_title_start")
         speak_reading_text(" ".join(parts), preferences)
         return
 
     if document_type == "Report":
+        _log_first_audio("first_page_title_start")
         speak("This is a Report.", preferences)
         return
 
     if document_type == "Printed_Letter":
+        _log_first_audio("first_page_title_start")
         speak("This is a Printed Letter.", preferences)
         return
 
     speak("The document type could not be identified clearly.", preferences)
 
 
-def describe_page_visual(
+def fetch_page_visual_description(
     image_path: Path,
     context: str,
-    preferences: Dict,
-) -> bool:
-    """
-    Call Abhishek /abhishek/describe-image and speak only if a picture is on the page.
-    Returns True when a caption was spoken.
-    """
+) -> Optional[Dict]:
+    """HTTP-only /describe-image fetch for prefetch during reading speech."""
     if image_path is None or not Path(image_path).exists():
-        return False
+        return None
 
     try:
+        started = time.perf_counter()
         with open(image_path, "rb") as image_file:
-            response = requests.post(
+            response = _http_session().post(
                 ABHISHEK_DESCRIBE_URL,
                 files={
                     "file": (Path(image_path).name, image_file, "image/jpeg"),
                 },
                 data={"context": context or "general"},
-                timeout=180,
+                timeout=_HTTP_TIMEOUT,
             )
+        print(
+            f"[controller] timing abhishek_describe={time.perf_counter() - started:.2f}s"
+        )
         response.raise_for_status()
-        result = response.json()
+        return response.json()
     except Exception as error:
         print("Abhishek describe-image failed:")
         print(error)
+        return None
+
+
+def speak_page_visual_result(
+    result: Optional[Dict],
+    preferences: Dict,
+) -> bool:
+    if not result or not isinstance(result, dict):
         return False
 
     description = (
@@ -301,6 +344,21 @@ def describe_page_visual(
     return False
 
 
+def describe_page_visual(
+    image_path: Path,
+    context: str,
+    preferences: Dict,
+) -> bool:
+    """
+    Call Abhishek /abhishek/describe-image and speak only if a picture is on the page.
+    Returns True when a caption was spoken.
+    """
+    return speak_page_visual_result(
+        fetch_page_visual_description(image_path, context),
+        preferences,
+    )
+
+
 def print_runtime_endpoints() -> None:
     print("Abhishek analyze:", ABHISHEK_ANALYZE_URL)
     print("Abhishek describe:", ABHISHEK_DESCRIBE_URL)
@@ -312,12 +370,16 @@ def print_runtime_endpoints() -> None:
 def send_image_to_abhishek(image_path: Path) -> Optional[Dict]:
     print("Controller sending image to Abhishek:", ABHISHEK_ANALYZE_URL)
     try:
+        started = time.perf_counter()
         with open(image_path, "rb") as image_file:
-            response = requests.post(
+            response = _http_session().post(
                 ABHISHEK_ANALYZE_URL,
                 files={"file": (image_path.name, image_file, "image/jpeg")},
-                timeout=180,
+                timeout=_HTTP_TIMEOUT,
             )
+        print(
+            f"[controller] timing abhishek_analyze={time.perf_counter() - started:.2f}s"
+        )
         response.raise_for_status()
         result = response.json()
         result["captured_image_path"] = str(image_path)
@@ -350,6 +412,17 @@ def run_camera_once(preferences: Dict, target_module: str) -> bool:
     env["RASHMI_PACE"] = "normal"
     env["RASHMI_TONE"] = "natural"
 
+    print("Starting camera script:", CAMERA_SCRIPT)
+    print("Target module:", target_module)
+    camera_started = time.perf_counter()
+
+    # Start YOLO/camera while speaking status so load overlaps with audio.
+    process = subprocess.Popen(
+        [sys.executable, str(CAMERA_SCRIPT)],
+        cwd=str(MANOJ_DIR),
+        env=env,
+    )
+
     if target_module == "abhishek":
         speak("Now I will turn on the camera.", preferences)
         speak("Please wait. The camera model is loading.", preferences)
@@ -357,18 +430,13 @@ def run_camera_once(preferences: Dict, target_module: str) -> bool:
         speak("Opening the camera to capture the page.", preferences)
         speak("Please wait. The camera model is loading.", preferences)
 
-    print("Starting camera script:", CAMERA_SCRIPT)
-    print("Target module:", target_module)
-
-    completed = subprocess.run(
-        [sys.executable, str(CAMERA_SCRIPT)],
-        cwd=str(MANOJ_DIR),
-        env=env,
-        check=False,
+    returncode = process.wait()
+    print(
+        f"[controller] timing camera_session={time.perf_counter() - camera_started:.2f}s "
+        f"exit={returncode}"
     )
-
-    print("Camera module closed. Exit code:", completed.returncode)
-    if completed.returncode != 0:
+    print("Camera module closed. Exit code:", returncode)
+    if returncode != 0:
         speak("Camera guidance failed.", preferences)
         return False
 
@@ -447,15 +515,21 @@ def run_harshaka_reading_for_image(
     Select a real detected category only. Never invent categories.
     Speak Harshaka text when available, then describe a picture on the page
     if one exists. Picture-only pages still get a description.
+
+    Describe-image can prefetch while reading speech plays (speech order preserved).
     """
     spoke_text = False
+    described = False
+    flow_started = time.perf_counter()
     try:
-        speak("Sending page to content reading module.", preferences)
-
-        analysis_result = analyze_page_with_harshaka(
-            image_path=str(image_path),
-            document_type=document_type,
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            analyze_future = pool.submit(
+                analyze_page_with_harshaka,
+                str(image_path),
+                document_type,
+            )
+            speak("Sending page to content reading module.", preferences)
+            analysis_result = analyze_future.result()
 
         print("Harshaka analysis result preview:")
         print(json.dumps({
@@ -484,33 +558,64 @@ def run_harshaka_reading_for_image(
             if depth not in {"summary", "full"}:
                 depth = default_depth if default_depth in {"summary", "full"} else "summary"
 
-            speak(
-                f"Preparing {depth} for {selected_category}.",
-                preferences,
-            )
-
-            final_result = generate_selected_harshaka_output(
-                analysis_result=analysis_result,
-                selected_category=selected_category,
-                depth=depth,
-            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                generate_future = pool.submit(
+                    generate_selected_harshaka_output,
+                    analysis_result,
+                    selected_category,
+                    depth,
+                )
+                speak(
+                    f"Preparing {depth} for {selected_category}.",
+                    preferences,
+                )
+                final_result = generate_future.result()
 
             print("Harshaka final result:")
             print(json.dumps(final_result, indent=4))
 
-            speak_harshaka_result(final_result, preferences)
-            spoke_text = True
+            describe_future = None
+            if describe_context:
+                describe_pool = ThreadPoolExecutor(max_workers=1)
+                describe_future = describe_pool.submit(
+                    fetch_page_visual_description,
+                    image_path,
+                    describe_context,
+                )
+            else:
+                describe_pool = None
 
-        described = False
-        if describe_context:
-            described = describe_page_visual(
-                image_path=image_path,
-                context=describe_context,
-                preferences=preferences,
-            )
+            try:
+                print(
+                    "[controller] timing page_to_reading_speech_start="
+                    f"{time.perf_counter() - flow_started:.2f}s"
+                )
+                speak_harshaka_result(final_result, preferences)
+                spoke_text = True
+
+                if describe_future is not None:
+                    described = speak_page_visual_result(
+                        describe_future.result(),
+                        preferences,
+                    )
+            finally:
+                if describe_pool is not None:
+                    describe_pool.shutdown(wait=False)
+        else:
+            if describe_context:
+                described = describe_page_visual(
+                    image_path=image_path,
+                    context=describe_context,
+                    preferences=preferences,
+                )
 
         if not spoke_text and not described:
             speak("No readable content was found for this page.", preferences)
+
+        print(
+            "[controller] timing harshaka_page_total="
+            f"{time.perf_counter() - flow_started:.2f}s"
+        )
 
     except Exception as error:
         print("Harshaka reading failed:")
@@ -708,6 +813,9 @@ def capture_and_identify_document(preferences: Dict) -> Optional[Dict]:
     if not ok:
         return None
 
+    # Camera subprocess already ran next_module analyze for abhishek target.
+    capture_ready_at = time.perf_counter()
+
     abhishek_result = read_json_file(ABHISHEK_RESULT_PATH)
     if not abhishek_result or str(abhishek_result.get("status", "")).lower() == "failed":
         image_path = get_latest_captured_image_path()
@@ -716,15 +824,27 @@ def capture_and_identify_document(preferences: Dict) -> Optional[Dict]:
             retried = send_image_to_abhishek(image_path)
             if retried:
                 abhishek_result = retried
+                capture_ready_at = time.perf_counter()
 
+    if abhishek_result and isinstance(abhishek_result, dict):
+        abhishek_result["_capture_ready_at"] = capture_ready_at
     return abhishek_result
 
 
 def run_document_workflow(abhishek_result: Dict, preferences: Dict) -> None:
     document_type = normalize_document_type(abhishek_result.get("document_type"))
     first_image_path = resolve_image_path(abhishek_result)
+    since_capture = abhishek_result.get("_capture_ready_at")
+    if not isinstance(since_capture, (int, float)):
+        since_capture = None
 
-    speak_first_page(abhishek_result, document_type, preferences)
+    workflow_started = time.perf_counter()
+    speak_first_page(
+        abhishek_result,
+        document_type,
+        preferences,
+        since_capture=since_capture,
+    )
 
     if document_type == "Novel":
         run_novel_loop(preferences)
@@ -741,6 +861,11 @@ def run_document_workflow(abhishek_result: Dict, preferences: Dict) -> None:
             "The document type could not be identified clearly.",
             preferences,
         )
+
+    print(
+        "[controller] timing document_workflow_total="
+        f"{time.perf_counter() - workflow_started:.2f}s type={document_type or 'unknown'}"
+    )
 
 
 def main():
@@ -766,7 +891,12 @@ def main():
             speak("Document analysis failed.", preferences)
         else:
             print("Abhishek result:")
-            print(json.dumps(abhishek_result, indent=4))
+            printable = {
+                key: value
+                for key, value in abhishek_result.items()
+                if not str(key).startswith("_")
+            }
+            print(json.dumps(printable, indent=4))
             run_document_workflow(abhishek_result, preferences)
 
         choice = ask_new_material_or_end(preferences)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 
 import torch
 from PIL import Image
@@ -26,6 +27,7 @@ _processor = None
 _model = None
 _device = None
 _load_error: str | None = None
+_LOAD_LOCK = threading.Lock()
 
 BACKGROUND_OBJECT_WORDS = {
     "hand",
@@ -148,86 +150,96 @@ def _load_florence():
     """Lazy-load Florence-2 processor/model once (official HF style + compat patch)."""
     global _processor, _model, _device, _load_error
 
-    if _model is not None and _processor is not None:
-        return _processor, _model, _device
+    with _LOAD_LOCK:
+        if _model is not None and _processor is not None:
+            return _processor, _model, _device
 
-    # Allow retry after a previous failure (e.g. missing deps installed later).
-    _load_error = None
+        # Allow retry after a previous failure (e.g. missing deps installed later).
+        _load_error = None
 
-    try:
-        import transformers
-        from transformers import AutoModelForCausalLM, AutoProcessor
-
-        tf_version = getattr(transformers, "__version__", "unknown")
-        print(f"[Florence] transformers version={tf_version}")
-        logger.info("Florence transformers version=%s", tf_version)
-
-        version_tuple = _transformers_version_tuple()
-        if version_tuple and version_tuple[0] >= 5:
-            print(
-                "[Florence] warning: transformers "
-                f"{tf_version} is often incompatible with Florence-2 "
-                "(forced_bos_token_id). Prefer transformers>=4.41,<4.50 "
-                "(recommended: 4.49.0)."
-            )
-            logger.warning(
-                "transformers %s may be incompatible with Florence-2",
-                tf_version,
-            )
-
-        _apply_florence_compat_patches()
-
-        _device = _get_device()
-        print(f"[Florence] Loading local Florence model: {MODEL_NAME}")
-        print(f"[Florence] Using device: {_device}")
-
-        torch_dtype = torch.float16 if _device == "cuda" else torch.float32
-
-        if _device == "cuda" and torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-        _processor = AutoProcessor.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True,
-        )
-        _model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-        )
         try:
-            _model = _model.to(_device)
-        except Exception as move_error:
-            print(f"[Florence] GPU load failed ({move_error}); using CPU.")
-            logger.warning("Florence GPU load failed: %s", move_error)
-            _device = "cpu"
-            _model = _model.to("cpu")
-        _ensure_forced_bos_token_id(_model)
-        _model.eval()
+            import transformers
+            from transformers import AutoModelForCausalLM, AutoProcessor
 
-        print("[Florence] loaded successfully")
-        logger.info("Florence loaded successfully on device=%s", _device)
-        return _processor, _model, _device
+            tf_version = getattr(transformers, "__version__", "unknown")
+            print(f"[Florence] transformers version={tf_version}")
+            logger.info("Florence transformers version=%s", tf_version)
 
-    except Exception as exc:
-        _processor = None
-        _model = None
-        _device = None
-        message = str(exc)
-        if "forced_bos_token_id" in message:
-            message = (
-                f"{message}. Installed transformers appears incompatible with "
-                "Florence-2. Install a compatible version, e.g. "
-                "`pip install 'transformers>=4.41.0,<4.50.0'` "
-                "(recommended: transformers==4.49.0)."
+            version_tuple = _transformers_version_tuple()
+            if version_tuple and version_tuple[0] >= 5:
+                print(
+                    "[Florence] warning: transformers "
+                    f"{tf_version} is often incompatible with Florence-2 "
+                    "(forced_bos_token_id). Prefer transformers>=4.41,<4.50 "
+                    "(recommended: 4.49.0)."
+                )
+                logger.warning(
+                    "transformers %s may be incompatible with Florence-2",
+                    tf_version,
+                )
+
+            _apply_florence_compat_patches()
+
+            _device = _get_device()
+            print(f"[Florence] Loading local Florence model: {MODEL_NAME}")
+            print(f"[Florence] Using device: {_device}")
+
+            torch_dtype = torch.float16 if _device == "cuda" else torch.float32
+
+            if _device == "cuda" and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            _processor = AutoProcessor.from_pretrained(
+                MODEL_NAME,
+                trust_remote_code=True,
             )
-        _load_error = f"Failed to load local Florence model: {message}"
-        print(f"[Florence] loaded failed: {_load_error}")
-        logger.exception("Florence load failed")
-        raise RuntimeError(_load_error) from exc
+            _model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+            )
+            try:
+                _model = _model.to(_device)
+            except Exception as move_error:
+                print(f"[Florence] GPU load failed ({move_error}); using CPU.")
+                logger.warning("Florence GPU load failed: %s", move_error)
+                _device = "cpu"
+                try:
+                    _model = _model.float()
+                except Exception:
+                    pass
+                _model = _model.to("cpu")
+            _ensure_forced_bos_token_id(_model)
+            _model.eval()
+
+            print("[Florence] loaded successfully")
+            logger.info("Florence loaded successfully on device=%s", _device)
+            return _processor, _model, _device
+
+        except Exception as exc:
+            _processor = None
+            _model = None
+            _device = None
+            message = str(exc)
+            if "forced_bos_token_id" in message:
+                message = (
+                    f"{message}. Installed transformers appears incompatible with "
+                    "Florence-2. Install a compatible version, e.g. "
+                    "`pip install 'transformers>=4.41.0,<4.50.0'` "
+                    "(recommended: transformers==4.49.0)."
+                )
+            _load_error = f"Failed to load local Florence model: {message}"
+            print(f"[Florence] loaded failed: {_load_error}")
+            logger.exception("Florence load failed")
+            raise RuntimeError(_load_error) from exc
+
+
+def preload_florence_model() -> None:
+    """Warm the module-level Florence cache using the existing loader."""
+    _load_florence()
 
 
 def _clean_text(text: str) -> str:

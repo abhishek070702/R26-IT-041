@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -88,14 +89,31 @@ configure_tesseract(CONFIG)
 CATEGORY_MODEL = load_category_model(CONFIG.category_model_path)
 
 DOCLAYOUT_MODEL = None
-try:
-    loaded = load_doclayout_model(CONFIG)
-    if isinstance(loaded, tuple):
-        DOCLAYOUT_MODEL = loaded[0]
-    else:
-        DOCLAYOUT_MODEL = loaded
-except Exception as error:
-    logger.warning("DocLayout-YOLO not loaded (%s). Using local geometry only.", error)
+_DOCLAYOUT_LOCK = threading.Lock()
+_DOCLAYOUT_LOAD_ATTEMPTED = False
+
+
+def get_doclayout_model():
+    """Load DocLayout-YOLO once, on first use, so API startup is not blocked."""
+    global DOCLAYOUT_MODEL, _DOCLAYOUT_LOAD_ATTEMPTED
+
+    with _DOCLAYOUT_LOCK:
+        if _DOCLAYOUT_LOAD_ATTEMPTED:
+            return DOCLAYOUT_MODEL
+        _DOCLAYOUT_LOAD_ATTEMPTED = True
+        try:
+            loaded = load_doclayout_model(CONFIG)
+            if isinstance(loaded, tuple):
+                DOCLAYOUT_MODEL = loaded[0]
+            else:
+                DOCLAYOUT_MODEL = loaded
+        except Exception as error:
+            DOCLAYOUT_MODEL = None
+            logger.warning(
+                "DocLayout-YOLO not loaded (%s). Using local geometry only.",
+                error,
+            )
+        return DOCLAYOUT_MODEL
 
 
 def _join_article_text(results: Any) -> str:
@@ -194,7 +212,7 @@ def analyze_content(
             document_type=document_type,
             category_model=CATEGORY_MODEL,
             config=CONFIG,
-            doclayout_model=DOCLAYOUT_MODEL,
+            doclayout_model=get_doclayout_model(),
         )
     finally:
         CONFIG.debug = previous_debug

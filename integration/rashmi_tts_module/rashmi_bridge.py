@@ -52,6 +52,7 @@ SAMPLE_RATE = int(os.getenv("RASHMI_SAMPLE_RATE", "16000"))
 BEEP_PATH = BASE_DIR / "listen_beep.wav"
 
 _VOSK_MODEL = None
+_VOSK_LOCK = threading.Lock()
 _WORKING_MIC = None
 
 
@@ -89,6 +90,7 @@ def speak_reading_text(text: str, preferences: Optional[Dict] = None):
     """
     Speak actual reading material only: title, cover/page pictures, Harshaka text.
     Applies saved reading_level, voice, pace, and tone.
+    Progressive TTS starts the first audio chunk as soon as it is synthesized.
     """
     text = str(text or "").strip()
     if not text:
@@ -102,8 +104,13 @@ def speak_reading_text(text: str, preferences: Optional[Dict] = None):
     if adapted != text:
         print("Reading text adapted for level:", level or "very simple")
 
+    started = time.perf_counter()
     try:
         speak_reading_voice(adapted, preferences)
+        print(
+            f"[rashmi] timing reading_speech_total={time.perf_counter() - started:.2f}s "
+            f"chars={len(adapted)}"
+        )
     except Exception as error:
         print("Reading TTS error:", error)
     return adapted
@@ -235,24 +242,28 @@ def _compact(text: str) -> str:
 def _get_vosk_model():
     global _VOSK_MODEL
 
-    if _VOSK_MODEL is not None:
-        return _VOSK_MODEL
+    with _VOSK_LOCK:
+        if _VOSK_MODEL is not None:
+            return _VOSK_MODEL
 
-    if not VOSK_MODEL_PATH.exists():
-        print("Vosk model not found:", VOSK_MODEL_PATH)
-        return None
+        if not VOSK_MODEL_PATH.exists():
+            print("Vosk model not found:", VOSK_MODEL_PATH)
+            return None
 
-    try:
-        from vosk import Model, SetLogLevel
+        try:
+            from vosk import Model, SetLogLevel
 
-        SetLogLevel(-1)
-        print("Loading Vosk speech model...")
-        _VOSK_MODEL = Model(str(VOSK_MODEL_PATH))
-        print("Vosk speech model ready.")
-        return _VOSK_MODEL
-    except Exception as error:
-        print("Could not load Vosk model:", error)
-        return None
+            SetLogLevel(-1)
+            print("Loading Vosk speech model...")
+            started = time.perf_counter()
+            _VOSK_MODEL = Model(str(VOSK_MODEL_PATH))
+            print(
+                f"Vosk speech model ready in {time.perf_counter() - started:.2f}s."
+            )
+            return _VOSK_MODEL
+        except Exception as error:
+            print("Could not load Vosk model:", error)
+            return None
 
 
 def _preload_speech_models():
@@ -632,12 +643,11 @@ def _listen_pi_stream(
                 "raw",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
         time.sleep(0.08)
         if process.poll() is not None:
-            err = (process.stderr.read() or b"").decode("utf-8", "ignore").strip()
-            last_error = err or f"arecord exited {process.returncode}"
+            last_error = f"arecord exited {process.returncode}"
             continue
 
         recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
@@ -1032,13 +1042,31 @@ def get_user_preferences():
     preload = threading.Thread(target=_preload_speech_models, daemon=True)
     preload.start()
 
+    # Start RFID wait while welcome speech plays (NFC, not microphone).
+    rfid_box: Dict[str, str] = {"id": ""}
+    rfid_started = time.perf_counter()
+
+    def _wait_for_rfid():
+        try:
+            rfid_box["id"] = read_rfid_uid().strip()
+        except Exception as error:
+            print("RFID wait error:", error)
+            rfid_box["id"] = ""
+
+    rfid_thread = threading.Thread(target=_wait_for_rfid, daemon=True)
+    rfid_thread.start()
+
     speak("Hello. Welcome to the Smart Reading Assistant System.")
     speak(
         "I will ask questions by voice. Wait until you hear a beep, then speak your answer."
     )
     speak("Please tap your RFID card on the right side of the device.")
 
-    rfid_id = read_rfid_uid().strip()
+    rfid_thread.join()
+    rfid_id = (rfid_box.get("id") or "").strip()
+    print(
+        f"[rashmi] timing rfid_wait_total={time.perf_counter() - rfid_started:.2f}s"
+    )
 
     if not rfid_id:
         rfid_id = "TEST_RFID_001"

@@ -1,9 +1,13 @@
 ﻿import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
+
+_HTTP = requests.Session()
+_HTTP_TIMEOUT = (5, 180)
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -38,8 +42,9 @@ def send_to_abhishek(image_path: Path):
     print("Sending image to Abhishek module...")
     print("URL:", ABHISHEK_API_URL)
 
+    started = time.perf_counter()
     with open(image_path, "rb") as image_file:
-        response = requests.post(
+        response = _HTTP.post(
             ABHISHEK_API_URL,
             files={
                 "file": (
@@ -48,8 +53,9 @@ def send_to_abhishek(image_path: Path):
                     "image/jpeg"
                 )
             },
-            timeout=180,
+            timeout=_HTTP_TIMEOUT,
         )
+    print(f"[next_module] timing abhishek_http={time.perf_counter() - started:.2f}s")
 
     response.raise_for_status()
     result = response.json()

@@ -11,13 +11,15 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 # Welcome-message voice. Used for guidance, camera cues, and other system talk.
 # User reading prefs (voice/pace/tone/level) must not change this.
@@ -152,6 +154,8 @@ AUDIO_DIR = Path(__file__).resolve().parent / "tts_outputs"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MAX_EDGE_CHARS = 3500
 MAX_OPENAI_CHARS = 3500
+# Prefer shorter first chunks so reading audio can start before full synthesis.
+PROGRESSIVE_CHUNK_CHARS = int(os.getenv("RASHMI_PROGRESSIVE_CHUNK_CHARS", "700"))
 
 _ENV_LOADED = False
 _OPENAI_CLIENT = None
@@ -160,6 +164,17 @@ _OPENAI_UNAVAILABLE = False
 _TTS_SERVER_UNAVAILABLE = False
 _EDGE_UNAVAILABLE = False
 _EDGE_LOCK = threading.Lock()
+_THREAD_HTTP = threading.local()
+
+
+def _http_session():
+    session = getattr(_THREAD_HTTP, "session", None)
+    if session is None:
+        import requests
+
+        session = requests.Session()
+        _THREAD_HTTP.session = session
+    return session
 
 
 def _voice_key(preferences: Optional[Dict] = None) -> str:
@@ -316,6 +331,84 @@ def _split_chunks(text: str, max_chars: int = MAX_EDGE_CHARS) -> list[str]:
         chunks.append(remaining[: split_at + 1].strip())
         remaining = remaining[split_at + 1 :].strip()
     return [item for item in chunks if item]
+
+
+def _split_progressive_chunks(
+    text: str,
+    max_chars: int = PROGRESSIVE_CHUNK_CHARS,
+) -> list[str]:
+    """
+    Sentence-aware chunks for earlier first audio.
+    Full reading order is preserved; only synthesis/playback is staged.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [item.strip() for item in sentences if item and item.strip()]
+    if not sentences:
+        return _split_chunks(text, max_chars)
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not current:
+            current = sentence
+            continue
+        if len(current) + 1 + len(sentence) <= max_chars:
+            current = f"{current} {sentence}"
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+
+    refined: list[str] = []
+    for chunk in chunks:
+        refined.extend(_split_chunks(chunk, max_chars))
+    return refined
+
+
+def _speak_chunks_progressive(
+    chunks: List[str],
+    preferences: Optional[Dict],
+    synth_fn: Callable[[str, Optional[Dict]], Path],
+) -> None:
+    """Play chunk N while synthesizing chunk N+1 so first audio starts sooner."""
+    if not chunks:
+        return
+
+    started = time.perf_counter()
+    first_audio_logged = False
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        next_future = pool.submit(synth_fn, chunks[0], preferences)
+        for index, _chunk in enumerate(chunks):
+            audio_path = next_future.result()
+            if index + 1 < len(chunks):
+                next_future = pool.submit(synth_fn, chunks[index + 1], preferences)
+            try:
+                if not first_audio_logged:
+                    print(
+                        "[tts] timing capture_or_request_to_first_audio_chunk="
+                        f"{time.perf_counter() - started:.2f}s "
+                        f"chunk=1/{len(chunks)}"
+                    )
+                    first_audio_logged = True
+                _play_mp3(audio_path)
+            finally:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    print(
+        f"[tts] timing full_progressive_playback={time.perf_counter() - started:.2f}s "
+        f"chunks={len(chunks)}"
+    )
 
 
 async def _edge_save(text: str, voice_name: str, rate: str, pitch: str, volume: str, out_path: Path):
@@ -615,33 +708,15 @@ def _synthesize_openai_mp3(text: str, preferences: Optional[Dict] = None) -> Pat
 
 
 def _speak_openai(text: str, preferences: Optional[Dict] = None) -> None:
-    chunks = _split_chunks(text, MAX_OPENAI_CHARS)
-    for chunk in chunks:
-        audio_path = None
-        try:
-            audio_path = _synthesize_openai_mp3(chunk, preferences)
-            _play_mp3(audio_path)
-        finally:
-            if audio_path is not None:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+    limit = min(MAX_OPENAI_CHARS, PROGRESSIVE_CHUNK_CHARS)
+    chunks = _split_progressive_chunks(text, limit)
+    _speak_chunks_progressive(chunks, preferences, _synthesize_openai_mp3)
 
 
 def _speak_edge(text: str, preferences: Optional[Dict] = None) -> None:
-    chunks = _split_chunks(text)
-    for chunk in chunks:
-        audio_path = None
-        try:
-            audio_path = _synthesize_edge_mp3(chunk, preferences)
-            _play_mp3(audio_path)
-        finally:
-            if audio_path is not None:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+    limit = min(MAX_EDGE_CHARS, PROGRESSIVE_CHUNK_CHARS)
+    chunks = _split_progressive_chunks(text, limit)
+    _speak_chunks_progressive(chunks, preferences, _synthesize_edge_mp3)
 
 
 def _combine_mp3s(paths: list[Path]) -> Path:
@@ -696,21 +771,25 @@ def _speak_via_tts_server(text: str, preferences: Optional[Dict] = None) -> bool
         return False
 
     try:
-        import requests
+        session = _http_session()
     except Exception as error:
         print("Laptop TTS client missing:", error)
         return False
 
-    AUDIO_DIR.mkdir(exist_ok=True)
-    out_path = AUDIO_DIR / f"rashmi_remote_{uuid.uuid4().hex[:10]}.mp3"
-    try:
-        response = requests.post(
+    chunks = _split_progressive_chunks(text, PROGRESSIVE_CHUNK_CHARS)
+    if not chunks:
+        return False
+
+    def _synth_remote(chunk: str, prefs: Optional[Dict]) -> Path:
+        AUDIO_DIR.mkdir(exist_ok=True)
+        out_path = AUDIO_DIR / f"rashmi_remote_{uuid.uuid4().hex[:10]}.mp3"
+        response = session.post(
             url,
             json={
-                "text": text,
-                "voice": _voice_key(preferences),
-                "pace": _pace_key(preferences),
-                "tone": _tone_key(preferences),
+                "text": chunk,
+                "voice": _voice_key(prefs),
+                "pace": _pace_key(prefs),
+                "tone": _tone_key(prefs),
             },
             timeout=(2.0, 45.0),
         )
@@ -723,8 +802,11 @@ def _speak_via_tts_server(text: str, preferences: Optional[Dict] = None) -> bool
         if not response.content:
             raise RuntimeError("TTS server returned empty audio")
         out_path.write_bytes(response.content)
-        print("TTS engine=laptop-server", url)
-        _play_mp3(out_path)
+        return out_path
+
+    try:
+        print("TTS engine=laptop-server", url, f"chunks={len(chunks)}")
+        _speak_chunks_progressive(chunks, preferences, _synth_remote)
         return True
     except Exception as error:
         message = str(error).lower()
@@ -743,11 +825,6 @@ def _speak_via_tts_server(text: str, preferences: Optional[Dict] = None) -> bool
             print("Laptop TTS server unreachable; not retrying until restart.")
         print("Laptop TTS server failed:", error)
         return False
-    finally:
-        try:
-            out_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def synthesize_speech_mp3(text: str, preferences: Optional[Dict] = None) -> Path:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 
 import torch
 from PIL import Image
@@ -26,6 +27,7 @@ _processor = None
 _model = None
 _device = None
 _load_error: str | None = None
+_LOAD_LOCK = threading.Lock()
 
 
 def _get_device() -> str:
@@ -35,40 +37,47 @@ def _get_device() -> str:
 def _load_blip():
     """
     Lazy-load BLIP processor/model once at module level.
+    Serialized so startup preload and the first request cannot load twice.
     """
     global _processor, _model, _device, _load_error
 
-    if _model is not None and _processor is not None:
-        return _processor, _model, _device
+    with _LOAD_LOCK:
+        if _model is not None and _processor is not None:
+            return _processor, _model, _device
 
-    if _load_error is not None:
-        raise RuntimeError(_load_error)
+        if _load_error is not None:
+            raise RuntimeError(_load_error)
 
-    try:
-        from transformers import BlipForConditionalGeneration, BlipProcessor
+        try:
+            from transformers import BlipForConditionalGeneration, BlipProcessor
 
-        _device = _get_device()
-        print(f"Loading local BLIP model: {MODEL_NAME}")
-        print(f"Using device: {_device}")
+            _device = _get_device()
+            print(f"Loading local BLIP model: {MODEL_NAME}")
+            print(f"Using device: {_device}")
 
-        _processor = BlipProcessor.from_pretrained(MODEL_NAME)
-        _model = BlipForConditionalGeneration.from_pretrained(MODEL_NAME)
-        _model = _model.to(_device)
-        _model.eval()
+            _processor = BlipProcessor.from_pretrained(MODEL_NAME)
+            _model = BlipForConditionalGeneration.from_pretrained(MODEL_NAME)
+            _model = _model.to(_device)
+            _model.eval()
 
-        print("BLIP loaded successfully")
-        print(f"Device used: {_device}")
-        logger.info("BLIP loaded successfully on device=%s", _device)
-        return _processor, _model, _device
+            print("BLIP loaded successfully")
+            print(f"Device used: {_device}")
+            logger.info("BLIP loaded successfully on device=%s", _device)
+            return _processor, _model, _device
 
-    except Exception as exc:
-        _processor = None
-        _model = None
-        _device = None
-        _load_error = f"Failed to load local BLIP model: {exc}"
-        print(_load_error)
-        logger.exception("BLIP load failed")
-        raise RuntimeError(_load_error) from exc
+        except Exception as exc:
+            _processor = None
+            _model = None
+            _device = None
+            _load_error = f"Failed to load local BLIP model: {exc}"
+            print(_load_error)
+            logger.exception("BLIP load failed")
+            raise RuntimeError(_load_error) from exc
+
+
+def preload_blip_model() -> None:
+    """Warm the module-level BLIP cache using the existing loader."""
+    _load_blip()
 
 
 def _collapse_repeated_words(text: str) -> str:

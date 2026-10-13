@@ -117,9 +117,6 @@ def predict_document_type(image_path):
             "confidence": round(confidence, 2)
         })
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     return best_class, round(best_confidence, 2), all_predictions
 
 

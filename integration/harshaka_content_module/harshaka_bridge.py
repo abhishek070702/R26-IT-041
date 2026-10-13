@@ -1,9 +1,21 @@
 ﻿import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 import requests
+
+_THREAD_HTTP = threading.local()
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_THREAD_HTTP, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_HTTP.session = session
+    return session
 
 
 HARSHAAKA_ANALYZE_URL = os.getenv(
@@ -35,13 +47,18 @@ def analyze_page_with_harshaka(
             "document_type": document_type,
         }
 
+    started = time.perf_counter()
+    read_timeout = timeout if isinstance(timeout, (int, float)) else 180
     with open(image, "rb") as image_file:
-        response = requests.post(
+        response = _http_session().post(
             HARSHAAKA_ANALYZE_URL,
             data={"document_type": document_type},
             files={"file": (image.name, image_file, "image/jpeg")},
-            timeout=timeout,
+            timeout=(5, read_timeout),
         )
+    print(
+        f"[harshaka] timing analyze_http={time.perf_counter() - started:.2f}s"
+    )
 
     response.raise_for_status()
 
@@ -113,10 +130,15 @@ def generate_selected_harshaka_output(
         "depth": depth,
     }
 
-    response = requests.post(
+    started = time.perf_counter()
+    read_timeout = timeout if isinstance(timeout, (int, float)) else 180
+    response = _http_session().post(
         HARSHAAKA_GENERATE_URL,
         json=payload,
-        timeout=timeout,
+        timeout=(5, read_timeout),
+    )
+    print(
+        f"[harshaka] timing generate_http={time.perf_counter() - started:.2f}s"
     )
 
     response.raise_for_status()

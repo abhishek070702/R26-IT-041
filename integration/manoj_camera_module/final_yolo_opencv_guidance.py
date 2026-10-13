@@ -7,6 +7,7 @@ import subprocess
 import threading
 import queue
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from collections import deque, Counter
@@ -803,17 +804,18 @@ def main():
     print("Loading YOLO model:", MODEL_PATH)
     print("This can take 10 to 30 seconds on Raspberry Pi. Please wait.")
     t_load = time.perf_counter()
-    model = YOLO(str(MODEL_PATH), task="detect")
-    model_names = model.names
-    print(f"YOLO model loaded in {time.perf_counter() - t_load:.1f}s")
-
-    print("Model classes:", model_names)
-    dummy = np.zeros((YOLO_IMAGE_SIZE, YOLO_IMAGE_SIZE, 3), dtype=np.uint8)
-    model.predict(dummy, imgsz=YOLO_IMAGE_SIZE, verbose=False)
-    print("YOLO warmup done.")
-
     print("Opening camera index:", CAMERA_INDEX)
-    cap = open_camera(CAMERA_INDEX)
+    with ThreadPoolExecutor(max_workers=1) as camera_pool:
+        camera_future = camera_pool.submit(open_camera, CAMERA_INDEX)
+        model = YOLO(str(MODEL_PATH), task="detect")
+        model_names = model.names
+        print(f"YOLO model loaded in {time.perf_counter() - t_load:.1f}s")
+
+        print("Model classes:", model_names)
+        dummy = np.zeros((YOLO_IMAGE_SIZE, YOLO_IMAGE_SIZE, 3), dtype=np.uint8)
+        model.predict(dummy, imgsz=YOLO_IMAGE_SIZE, verbose=False)
+        print("YOLO warmup done.")
+        cap = camera_future.result()
 
     if cap is None or not cap.isOpened():
         print("ERROR: USB camera not opened.")
@@ -962,12 +964,21 @@ def main():
         ):
             voice.say("Capturing now.", force=True)
 
+            capture_t0 = time.perf_counter()
             captured_image_path = save_capture(
                 clean_frame,
                 detection
             )
+            print(
+                f"[camera] timing save_capture={time.perf_counter() - capture_t0:.2f}s"
+            )
 
+            handoff_t0 = time.perf_counter()
             send_to_next_module(captured_image_path)
+            print(
+                f"[camera] timing next_module_handoff="
+                f"{time.perf_counter() - handoff_t0:.2f}s"
+            )
 
             voice.say("Page captured successfully.", force=True)
 

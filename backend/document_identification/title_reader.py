@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -14,14 +15,56 @@ logger = logging.getLogger(__name__)
 
 
 # =========================
-# Load EasyOCR reader
+# Load EasyOCR reader (lazy, CPU)
 # =========================
 
 # EasyOCR uses CPU to avoid CUDA out-of-memory issues.
-reader = easyocr.Reader(
-    ["en"],
-    gpu=False
-)
+_reader = None
+_reader_error: str | None = None
+_READER_LOCK = threading.Lock()
+
+
+def _get_easyocr_reader():
+    """Load EasyOCR once. Safe for startup preload and concurrent title reads."""
+    global _reader, _reader_error
+
+    with _READER_LOCK:
+        if _reader is not None:
+            return _reader
+        if _reader_error is not None:
+            raise RuntimeError(_reader_error)
+        try:
+            print("Loading EasyOCR reader (CPU)...")
+            started = time.perf_counter()
+            _reader = easyocr.Reader(
+                ["en"],
+                gpu=False,
+            )
+            elapsed = time.perf_counter() - started
+            print("EasyOCR title reader loaded successfully")
+            print("EasyOCR GPU: False")
+            print(f"[title_reader] EasyOCR loaded in {elapsed:.2f}s")
+            logger.info("EasyOCR loaded in %.2fs gpu=False", elapsed)
+            return _reader
+        except Exception as exc:
+            _reader = None
+            _reader_error = f"Failed to load EasyOCR: {exc}"
+            print(_reader_error)
+            logger.exception("EasyOCR load failed")
+            raise RuntimeError(_reader_error) from exc
+
+
+class _EasyOCRReaderProxy:
+    def __getattr__(self, name):
+        return getattr(_get_easyocr_reader(), name)
+
+
+reader = _EasyOCRReaderProxy()
+
+
+def preload_easyocr() -> None:
+    """Warm the EasyOCR cache using the existing loader."""
+    _get_easyocr_reader()
 
 NEWSPAPER_NAME_FALLBACK = "Newspaper name not clearly detected"
 
@@ -1939,5 +1982,4 @@ def create_device_message(document_type, title=None):
     return f"This is a {readable_name}."
 
 
-print("EasyOCR title reader loaded successfully")
-print("EasyOCR GPU: False")
+print("EasyOCR title reader module loaded (lazy model load on first use)")

@@ -55,7 +55,10 @@ def send_to_abhishek(image_path: Path):
             },
             timeout=_HTTP_TIMEOUT,
         )
-    print(f"[next_module] timing abhishek_http={time.perf_counter() - started:.2f}s")
+    print(
+        "[next_module] timing capture_to_abhishek_response="
+        f"{time.perf_counter() - started:.2f}s"
+    )
 
     response.raise_for_status()
     result = response.json()

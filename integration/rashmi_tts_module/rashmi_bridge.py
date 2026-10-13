@@ -54,6 +54,7 @@ BEEP_PATH = BASE_DIR / "listen_beep.wav"
 _VOSK_MODEL = None
 _VOSK_LOCK = threading.Lock()
 _WORKING_MIC = None
+_SPEECH_PRELOAD_THREAD: Optional[threading.Thread] = None
 
 
 def _voice_name(preferences: Optional[Dict] = None) -> str:
@@ -80,8 +81,13 @@ def speak(text: str, preferences: Optional[Dict] = None):
         return
 
     print("TTS:", text)
+    started = time.perf_counter()
     try:
         speak_preference_voice(text, system_speech_preferences())
+        print(
+            f"[rashmi] timing welcome_or_system_speech="
+            f"{time.perf_counter() - started:.2f}s chars={len(text)}"
+        )
     except Exception as error:
         print("TTS error:", error)
 
@@ -275,6 +281,32 @@ def _preload_speech_models():
         classifier_ready()
     except Exception as error:
         print("Tone classifier preload failed:", error)
+    # Warm OpenAI client only (no paid speech request) so first reading TTS
+    # does not pay client/import latency after capture.
+    try:
+        from preference_tts import _openai_client
+
+        _openai_client()
+    except Exception:
+        try:
+            from .preference_tts import _openai_client
+
+            _openai_client()
+        except Exception as error:
+            print("OpenAI TTS client warm-up skipped:", error)
+
+
+def _ensure_speech_input_ready(timeout_sec: float = 60.0) -> None:
+    """Wait for Vosk preload only when listening is about to start."""
+    global _SPEECH_PRELOAD_THREAD
+    thread = _SPEECH_PRELOAD_THREAD
+    if thread is None or not thread.is_alive():
+        return
+    started = time.perf_counter()
+    thread.join(timeout=timeout_sec)
+    print(
+        f"[rashmi] timing vosk_ready_wait={time.perf_counter() - started:.2f}s"
+    )
 
 
 def _typed_input_requested() -> bool:
@@ -873,6 +905,8 @@ def ask_by_voice(
         print(f"Listening... attempt {attempt}/{attempts}")
         print("Wait for the beep, then speak.")
 
+        # Vosk is only required for listening, not for asking the question.
+        _ensure_speech_input_ready()
         answer_text = listen_once(
             max_seconds=max_seconds,
             valid_answers=valid_answers,
@@ -1036,11 +1070,17 @@ def get_user_preferences():
     Wait for a PN532 card tap on the Pi. Keyboard entry is only a fallback.
     After the card id, preferences are collected by Rashmi voice input.
     """
+    global _SPEECH_PRELOAD_THREAD
+
     init_database()
 
     print("Loading speech models in the background...")
-    preload = threading.Thread(target=_preload_speech_models, daemon=True)
-    preload.start()
+    _SPEECH_PRELOAD_THREAD = threading.Thread(
+        target=_preload_speech_models,
+        daemon=True,
+        name="speech-preload",
+    )
+    _SPEECH_PRELOAD_THREAD.start()
 
     # Start RFID wait while welcome speech plays (NFC, not microphone).
     rfid_box: Dict[str, str] = {"id": ""}
@@ -1056,38 +1096,57 @@ def get_user_preferences():
     rfid_thread = threading.Thread(target=_wait_for_rfid, daemon=True)
     rfid_thread.start()
 
-    speak("Hello. Welcome to the Smart Reading Assistant System.")
+    welcome_started = time.perf_counter()
+    # One synthesis/playback round-trip instead of three sequential waits.
+    # Exact welcome wording is preserved.
     speak(
-        "I will ask questions by voice. Wait until you hear a beep, then speak your answer."
+        "Hello. Welcome to the Smart Reading Assistant System. "
+        "I will ask questions by voice. Wait until you hear a beep, then speak your answer. "
+        "Please tap your RFID card on the right side of the device.",
     )
-    speak("Please tap your RFID card on the right side of the device.")
+    print(
+        f"[rashmi] timing welcome_speech_total="
+        f"{time.perf_counter() - welcome_started:.2f}s"
+    )
 
     rfid_thread.join()
     rfid_id = (rfid_box.get("id") or "").strip()
+    rfid_detected_at = time.perf_counter()
     print(
-        f"[rashmi] timing rfid_wait_total={time.perf_counter() - rfid_started:.2f}s"
+        f"[rashmi] timing rfid_wait_total={rfid_detected_at - rfid_started:.2f}s"
     )
 
     if not rfid_id:
         rfid_id = "TEST_RFID_001"
 
     print("RFID card ID:", rfid_id)
-    preload.join(timeout=60)
 
     user = find_user(rfid_id)
 
     if user is None:
+        # Listening needs Vosk; speak/ask_new_preferences will wait at listen time.
         return ask_new_preferences(rfid_id)
 
     preferences = _preferences_from_user(user)
 
+    # Do not block on Vosk preload before speaking the preferences question.
+    prefs_prompt_started = time.perf_counter()
     speak("Known RFID card detected.", preferences)
+    print(
+        "[rashmi] timing rfid_to_preferences_prompt_start="
+        f"{time.perf_counter() - rfid_detected_at:.2f}s"
+    )
 
     answer = ask_by_voice(
         "Do you want to use your previous preferences? Say yes or no.",
         ["yes", "no"],
         "yes",
         preferences,
+    )
+    print(
+        "[rashmi] timing rfid_to_preferences_answer="
+        f"{time.perf_counter() - rfid_detected_at:.2f}s "
+        f"prompt_block={time.perf_counter() - prefs_prompt_started:.2f}s"
     )
 
     if answer == "yes":

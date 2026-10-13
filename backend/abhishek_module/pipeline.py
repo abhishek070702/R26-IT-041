@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 # Explicitly load backend/.env (this file lives in backend/abhishek_module/).
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 _ENV_PATH = _BACKEND_DIR / ".env"
-load_dotenv(dotenv_path=_ENV_PATH, override=True)
+# Do not override variables already set in the shell (e.g. IMAGE_DESCRIPTION_MODEL=blip).
+load_dotenv(dotenv_path=_ENV_PATH, override=False)
 print(f"[pipeline] loaded env from: {_ENV_PATH} (exists={_ENV_PATH.is_file()})")
 
 # Optional imports — if missing, placeholders are used instead.
@@ -614,8 +615,8 @@ def _read_title(image_path: str, document_type: str) -> tuple[str, list[str], st
 
 
 def _reload_backend_env() -> None:
-    """Reload backend/.env with override so IMAGE_DESCRIPTION_MODEL is applied."""
-    load_dotenv(dotenv_path=_ENV_PATH, override=True)
+    """Reload backend/.env without clobbering shell-exported settings."""
+    load_dotenv(dotenv_path=_ENV_PATH, override=False)
 
 
 def _selected_image_description_model() -> str:

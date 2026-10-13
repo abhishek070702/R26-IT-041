@@ -380,6 +380,55 @@ def is_weak_cover_title(
     return False, ""
 
 
+TITLE_LINE_STOPWORDS = frozenset({"THE", "A", "AN", "AND", "OF"})
+
+
+def _is_stopword_only_title_line(text: str) -> bool:
+    words = clean_easyocr_title_text(text).split()
+    return bool(words) and all(word in TITLE_LINE_STOPWORDS for word in words)
+
+
+def tidy_cover_title_text(text: str) -> str:
+    """Drop edge filler words left after joining OCR title fragments."""
+    words = collapse_repeated_words(strip_cover_noise_words(text)).split()
+    while words and words[-1].upper() in TITLE_LINE_STOPWORDS:
+        words.pop()
+    while words and words[0].upper() in {"AND", "OF"}:
+        words.pop(0)
+    return " ".join(words)
+
+
+def plausible_raw_cover_title(text: str, document_type: str) -> str | None:
+    """
+    Accept a readable Novel/Magazine title from OCR when it is not a known book.
+    Requires at least two real content words so we do not invent titles.
+    """
+    cleaned = tidy_cover_title_text(text)
+    if not cleaned:
+        return None
+    if contains_cover_noise_text(cleaned) or is_long_author_or_subtitle_fragment(cleaned):
+        return None
+    if is_bad_easyocr_title(cleaned):
+        return None
+
+    words = cleaned.split()
+    content = [
+        word
+        for word in words
+        if word not in TITLE_LINE_STOPWORDS and len(word) >= 3
+    ]
+    if len(content) < 2:
+        return None
+    if len(words) > 10:
+        return None
+    letters = sum(ch.isalpha() for ch in cleaned.replace(" ", ""))
+    if letters < 8:
+        return None
+    if document_type == "Magazine" and len(content) == 1:
+        return nice_title_case(cleaned)
+    return nice_title_case(cleaned)
+
+
 def collapse_repeated_words(text: str) -> str:
     """Collapse consecutive repeats and drop later duplicate tokens."""
     words = text.split()
@@ -442,7 +491,12 @@ def is_long_author_or_subtitle_fragment(text: str) -> bool:
     """Reject long author/subtitle OCR fragments mistaken for titles."""
     cleaned = clean_easyocr_title_text(text)
     words = cleaned.split()
-    if len(words) >= 5:
+    if (
+        len(words) >= 5
+        and words[0] not in {"THE", "A", "AN"}
+        and "AND" not in words
+        and "OF" not in words
+    ):
         return True
     if looks_like_person_name(cleaned):
         return True
@@ -471,25 +525,8 @@ def is_confident_cover_title(title: str, document_type: str) -> bool:
     if is_known_corrected_title(title_str, document_type):
         return True
 
-    if contains_cover_noise_text(title_str):
-        return False
-    if is_long_author_or_subtitle_fragment(title_str):
-        return False
-
-    cleaned = clean_easyocr_title_text(title_str)
-    words = cleaned.split()
-    if not words:
-        return False
-
-    # Strong single-word magazine/novel brands only.
-    if len(words) == 1 and words[0] in STRONG_SINGLE_WORD_TITLES:
-        known_single = detect_known_easyocr_title(words[0], document_type)
-        if known_single is not None and known_single == title_str:
-            return True
-        if document_type == "Magazine" and nice_title_case(words[0]) == title_str:
-            return True
-
-    return False
+    finalized = finalize_cover_title(title_str, document_type)
+    return finalized is not None
 
 
 def finalize_cover_title(text: str, document_type: str) -> str | None:
@@ -497,11 +534,8 @@ def finalize_cover_title(text: str, document_type: str) -> str | None:
     Return only a trusted Novel/Magazine title.
     If OCR text cannot be confidently corrected, return None.
     """
-    text = collapse_repeated_words(strip_cover_noise_words(text))
+    text = tidy_cover_title_text(text)
     if text == "":
-        return None
-
-    if contains_cover_noise_text(text) or is_long_author_or_subtitle_fragment(text):
         return None
 
     composed = compose_known_title_from_tokens(text.split(), document_type)
@@ -512,6 +546,9 @@ def finalize_cover_title(text: str, document_type: str) -> str | None:
     if known is not None:
         return known
 
+    if contains_cover_noise_text(text) or is_long_author_or_subtitle_fragment(text):
+        return None
+
     words = text.split()
     if len(words) == 1 and words[0] in STRONG_SINGLE_WORD_TITLES:
         known_single = detect_known_easyocr_title(words[0], document_type)
@@ -520,7 +557,10 @@ def finalize_cover_title(text: str, document_type: str) -> str | None:
         if document_type == "Magazine":
             return nice_title_case(words[0])
 
-    # Do not invent titles from raw OCR.
+    plausible = plausible_raw_cover_title(text, document_type)
+    if plausible is not None:
+        return plausible
+
     return None
 
 
@@ -633,6 +673,10 @@ def detect_known_easyocr_title(text, document_type):
         "UNCLE TOM S CABIN": "Uncle Tom's Cabin",
         "UNCLE TOMS CABIN": "Uncle Tom's Cabin",
         "UNCLE TOM CABIN": "Uncle Tom's Cabin",
+        "THE BOAR AND THE TIGER": "The Boar and the Tiger",
+        "BOAR AND THE TIGER": "The Boar and the Tiger",
+        "THE TIGER AND THE BOAR": "The Tiger and the Boar",
+        "TIGER AND THE BOAR": "The Tiger and the Boar",
     }
 
     # Prefer longer magazine brand matches first via sorted check below.
@@ -987,7 +1031,12 @@ def select_main_title_cluster(candidates: list[dict]) -> list[dict]:
         return []
 
     ranked = sorted(
-        candidates,
+        [
+            item
+            for item in candidates
+            if not _is_stopword_only_title_line(str(item.get("text") or ""))
+        ]
+        or candidates,
         key=lambda x: (float(x.get("height", 0.0)), float(x.get("cover_score", 0.0))),
         reverse=True,
     )
@@ -1014,6 +1063,8 @@ def select_main_title_cluster(candidates: list[dict]) -> list[dict]:
             continue
         # Keep lines near the main title vertically.
         if abs(float(item["y_min"]) - float(best["y_min"])) > max(max_h * 2.8, 70.0):
+            continue
+        if _is_stopword_only_title_line(str(item.get("text") or "")):
             continue
         cluster.append(item)
 
@@ -1214,7 +1265,9 @@ def group_fallback_title_candidates(lines: list[dict]) -> list[str]:
         cluster = [best]
 
     cluster = sorted(cluster, key=lambda x: (x["y_min"], x["x_min"]))
-    grouped_text = collapse_repeated_words(" ".join(item["text"] for item in cluster[:6]))
+    grouped_text = tidy_cover_title_text(
+        " ".join(item["text"] for item in cluster[:6])
+    )
 
     candidates = [grouped_text]
     for item in usable[:8]:
@@ -1524,10 +1577,8 @@ def extract_novel_magazine_title(image_path: str, document_type: str) -> str:
                 if filtered:
                     cluster = select_main_title_cluster(filtered)
                     central_group_texts = [item["text"] for item in cluster]
-                    cluster_text = collapse_repeated_words(
-                        strip_cover_noise_words(
-                            " ".join(item["text"] for item in cluster)
-                        )
+                    cluster_text = tidy_cover_title_text(
+                        " ".join(item["text"] for item in cluster)
                     )
                     composed = compose_known_title_from_tokens(
                         cluster_text.split(), document_type

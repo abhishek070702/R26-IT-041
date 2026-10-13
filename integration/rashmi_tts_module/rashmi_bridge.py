@@ -1,12 +1,16 @@
 import json
+import math
 import os
 import platform
 import queue
 import re
+import shutil
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -43,10 +47,12 @@ VOSK_MODEL_PATH = Path(
     )
 )
 
-MIC_DEVICE = os.getenv("RASHMI_MIC_DEVICE", "plughw:2,0")
+MIC_DEVICE = os.getenv("RASHMI_MIC_DEVICE", "plughw:3,0")
 SAMPLE_RATE = int(os.getenv("RASHMI_SAMPLE_RATE", "16000"))
+BEEP_PATH = BASE_DIR / "listen_beep.wav"
 
 _VOSK_MODEL = None
+_WORKING_MIC = None
 
 
 def _voice_name(preferences: Optional[Dict] = None) -> str:
@@ -353,6 +359,331 @@ def _clean_recognized_text(text: str) -> str:
     return cleaned
 
 
+def _ensure_beep_wav() -> Path:
+    if BEEP_PATH.exists() and BEEP_PATH.stat().st_size > 400:
+        return BEEP_PATH
+
+    rate = 16000
+    duration = 0.22
+    freq = 880.0
+    n_samples = int(rate * duration)
+    fade = 240
+    frames = bytearray()
+    for index in range(n_samples):
+        envelope = min(1.0, index / fade, (n_samples - index) / fade)
+        sample = int(
+            0.38 * envelope * 32767 * math.sin(2.0 * math.pi * freq * index / rate)
+        )
+        frames += struct.pack("<h", max(-32767, min(32767, sample)))
+
+    BEEP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(BEEP_PATH), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(rate)
+        wav_file.writeframes(frames)
+    return BEEP_PATH
+
+
+def _play_listen_beep() -> None:
+    """Play a short cue, then wait so the speaker releases before recording."""
+    beep_path = _ensure_beep_wav()
+    played = False
+
+    if "windows" in platform.system().lower():
+        try:
+            import winsound
+
+            winsound.PlaySound(str(beep_path), winsound.SND_FILENAME)
+            played = True
+        except Exception as error:
+            print("Beep playback failed:", error)
+
+    if not played:
+        for command in (
+            ["aplay", "-q", str(beep_path)],
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(beep_path)],
+            ["paplay", str(beep_path)],
+            ["mpv", "--no-video", "--really-quiet", str(beep_path)],
+        ):
+            if shutil.which(command[0]) is None:
+                continue
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                played = True
+                break
+
+    if not played:
+        print("Listen beep could not be played; listening anyway.")
+    else:
+        print("Listen beep played. Speak now.")
+    time.sleep(0.12)
+
+
+def _discover_alsa_capture_devices() -> List[str]:
+    devices: List[str] = []
+    try:
+        listed = subprocess.run(
+            ["arecord", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as error:
+        print("Could not list ALSA capture devices:", error)
+        return devices
+
+    output = listed.stdout or ""
+    print("ALSA capture devices:\n" + (output.strip() or "(none)"))
+    for line in output.splitlines():
+        match = re.search(
+            r"card\s+(\d+)\s*:\s*(\S+).*?device\s+(\d+)\s*:",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        card, card_name, dev = match.group(1), match.group(2), match.group(3)
+        devices.extend(
+            [
+                f"plughw:{card},{dev}",
+                f"hw:{card},{dev}",
+                f"plughw:CARD={card_name},DEV={dev}",
+            ]
+        )
+    return devices
+
+
+def _mic_device_candidates() -> List[str]:
+    if _WORKING_MIC:
+        return [_WORKING_MIC]
+    seen: List[str] = []
+    for device in (
+        [MIC_DEVICE]
+        + _discover_alsa_capture_devices()
+        + [
+            "pulse",
+            "pipewire",
+            "sysdefault",
+            "plughw:3,0",
+            "plughw:2,0",
+            "plughw:1,0",
+            "plughw:0,0",
+        ]
+    ):
+        name = str(device or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    if len(pcm) < 4:
+        return 0.0
+    count = len(pcm) // 2
+    total = 0.0
+    for index in range(0, len(pcm) - 1, 2):
+        sample = struct.unpack_from("<h", pcm, index)[0]
+        total += float(sample) * float(sample)
+    return math.sqrt(total / max(count, 1)) / 32768.0
+
+
+def _recognize_pcm(
+    model,
+    pcm: bytes,
+    valid_answers: Optional[List[str]] = None,
+) -> str:
+    if not pcm:
+        return ""
+
+    recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
+    detected_text = ""
+    chunk_size = 4000
+    for offset in range(0, len(pcm), chunk_size):
+        chunk = pcm[offset : offset + chunk_size]
+        if recognizer.AcceptWaveform(chunk):
+            result = json.loads(recognizer.Result())
+            text = _clean_recognized_text(result.get("text", ""))
+            if text:
+                detected_text = text
+                break
+    if not detected_text:
+        final_result = json.loads(recognizer.FinalResult())
+        detected_text = _clean_recognized_text(final_result.get("text", ""))
+
+    if detected_text or not valid_answers:
+        return detected_text
+
+    # Grammar pass missed the words; try free recognition on the same clip.
+    recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, None)
+    for offset in range(0, len(pcm), chunk_size):
+        chunk = pcm[offset : offset + chunk_size]
+        if recognizer.AcceptWaveform(chunk):
+            result = json.loads(recognizer.Result())
+            text = _clean_recognized_text(result.get("text", ""))
+            if text:
+                return text
+    final_result = json.loads(recognizer.FinalResult())
+    return _clean_recognized_text(final_result.get("text", ""))
+
+
+def _wav_to_mono_pcm(wav_path: Path) -> bytes:
+    with wave.open(str(wav_path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        frames = wav_file.readframes(wav_file.getnframes())
+        sample_width = wav_file.getsampwidth()
+    if sample_width != 2:
+        return frames
+    if channels <= 1:
+        return frames
+    mono = bytearray()
+    frame_count = len(frames) // (2 * channels)
+    for index in range(frame_count):
+        total = 0
+        for channel in range(channels):
+            offset = (index * channels + channel) * 2
+            total += struct.unpack_from("<h", frames, offset)[0]
+        sample = int(total / channels)
+        mono += struct.pack("<h", max(-32767, min(32767, sample)))
+    return bytes(mono)
+
+
+def _record_pi_pcm(max_seconds: int, device: str) -> tuple[bytes, str]:
+    wav_path = BASE_DIR / "last_listen.wav"
+    last_error = ""
+    for channels in (1, 2):
+        command = [
+            "arecord",
+            "-D",
+            device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(SAMPLE_RATE),
+            "-c",
+            str(channels),
+            "-t",
+            "wav",
+            "-d",
+            str(max(1, int(max_seconds))),
+            str(wav_path),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(max_seconds + 4, 8),
+            check=False,
+        )
+        error_text = (result.stderr or result.stdout or "").strip()
+        if result.returncode != 0:
+            last_error = error_text or f"arecord exited {result.returncode}"
+            if channels == 1 and "channel" in last_error.lower():
+                continue
+            return b"", last_error
+        if not wav_path.exists():
+            last_error = error_text or "arecord did not write a recording"
+            continue
+        try:
+            return _wav_to_mono_pcm(wav_path), error_text
+        except Exception as error:
+            last_error = str(error)
+    return b"", last_error or "arecord failed"
+
+
+def _downmix_stereo_chunk(data: bytes) -> bytes:
+    usable = data[: len(data) // 4 * 4]
+    if not usable:
+        return b""
+    mono = bytearray()
+    for index in range(0, len(usable), 4):
+        left = struct.unpack_from("<h", usable, index)[0]
+        right = struct.unpack_from("<h", usable, index + 2)[0]
+        mono += struct.pack("<h", int((left + right) / 2))
+    return bytes(mono)
+
+
+def _listen_pi_stream(
+    model,
+    max_seconds: int,
+    valid_answers: Optional[List[str]],
+    device: str,
+) -> tuple[str, str]:
+    last_error = ""
+    for channels in (1, 2):
+        process = subprocess.Popen(
+            [
+                "arecord",
+                "-D",
+                device,
+                "-f",
+                "S16_LE",
+                "-r",
+                str(SAMPLE_RATE),
+                "-c",
+                str(channels),
+                "-t",
+                "raw",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.08)
+        if process.poll() is not None:
+            err = (process.stderr.read() or b"").decode("utf-8", "ignore").strip()
+            last_error = err or f"arecord exited {process.returncode}"
+            continue
+
+        recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
+        detected_text = ""
+        pcm = bytearray()
+        started = time.monotonic()
+        read_size = 4000 if channels == 1 else 8000
+        try:
+            while time.monotonic() - started < max_seconds:
+                data = process.stdout.read(read_size)
+                if not data:
+                    break
+                if channels == 2:
+                    data = _downmix_stereo_chunk(data)
+                if not data:
+                    continue
+                pcm.extend(data)
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    text = _clean_recognized_text(result.get("text", ""))
+                    if text:
+                        detected_text = text
+                        break
+            if not detected_text:
+                final_result = json.loads(recognizer.FinalResult())
+                detected_text = _clean_recognized_text(final_result.get("text", ""))
+            if not detected_text and valid_answers and pcm:
+                detected_text = _recognize_pcm(model, bytes(pcm), None)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=0.8)
+            except Exception:
+                process.kill()
+
+        level = _pcm_rms(bytes(pcm))
+        print(f"Microphone level: {level:.4f}")
+        if detected_text:
+            return detected_text, ""
+        if level < 0.004:
+            last_error = f"silent recording on {device}"
+            continue
+        return "", last_error
+    return "", last_error or "arecord failed"
+
+
 def _listen_with_sounddevice(
     max_seconds: int,
     valid_answers: Optional[List[str]] = None,
@@ -378,6 +709,7 @@ def _listen_with_sounddevice(
             print("Audio status:", status)
         audio_queue.put(bytes(indata))
 
+    _play_listen_beep()
     print("Speak now...")
     detected_text = ""
     started = time.monotonic()
@@ -412,7 +744,7 @@ def _listen_with_sounddevice(
 
 
 def listen_once(
-    max_seconds: int = 8,
+    max_seconds: int = 4,
     valid_answers: Optional[List[str]] = None,
 ) -> str:
     """
@@ -439,49 +771,24 @@ def listen_once(
         return input("Voice model unavailable. Type answer: ").strip().lower()
 
     try:
-        recognizer = _make_vosk_recognizer(model, SAMPLE_RATE, valid_answers)
+        global _WORKING_MIC
+        _play_listen_beep()
+        last_error = ""
+        for device in _mic_device_candidates():
+            print("Listening on microphone:", device)
+            detected_text, error_text = _listen_pi_stream(
+                model, max_seconds, valid_answers, device
+            )
+            if detected_text:
+                _WORKING_MIC = device
+                print("Recognized speech:", detected_text)
+                return detected_text
+            if error_text:
+                last_error = error_text
+                print("arecord failed on", device, ":", error_text)
 
-        process = subprocess.Popen(
-            [
-                "arecord",
-                "-D", MIC_DEVICE,
-                "-f", "S16_LE",
-                "-r", str(SAMPLE_RATE),
-                "-c", "1",
-                "-t", "raw",
-                "-d", str(max_seconds),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-
-        detected_text = ""
-
-        try:
-            while True:
-                data = process.stdout.read(4000)
-
-                if not data:
-                    break
-
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    text = _clean_recognized_text(result.get("text", ""))
-
-                    if text:
-                        detected_text = text
-                        break
-
-            if not detected_text:
-                final_result = json.loads(recognizer.FinalResult())
-                detected_text = _clean_recognized_text(final_result.get("text", ""))
-
-        finally:
-            process.terminate()
-            process.wait()
-
-        print("Recognized speech:", detected_text)
-        return detected_text
+        print("Voice input error:", last_error or "no usable microphone")
+        return ""
 
     except Exception as error:
         print("Voice input error:", error)
@@ -540,7 +847,7 @@ def ask_by_voice(
     default_answer: Optional[str] = None,
     preferences: Optional[Dict] = None,
     attempts: int = 3,
-    max_seconds: int = 8,
+    max_seconds: int = 4,
 ):
     """
     Ask user by Rashmi TTS and capture answer with Vosk.
@@ -554,6 +861,7 @@ def ask_by_voice(
         allowed_text = ", ".join(valid_answers)
         print(f"Allowed answers: {allowed_text}")
         print(f"Listening... attempt {attempt}/{attempts}")
+        print("Wait for the beep, then speak.")
 
         answer_text = listen_once(
             max_seconds=max_seconds,
@@ -562,7 +870,7 @@ def ask_by_voice(
         selected = _match_answer(answer_text, valid_answers)
 
         if selected is not None:
-            speak(f"You selected {selected}.", preferences)
+            print("Voice answer:", selected)
             return selected
 
         speak("Sorry, I did not understand. Please try again.", preferences)
@@ -592,7 +900,7 @@ def ask_category_by_voice(categories: List[str], preferences: Optional[Dict] = N
         default_answer=clean_categories[0],
         preferences=preferences,
         attempts=3,
-        max_seconds=8,
+        max_seconds=4,
     )
 
 
@@ -603,7 +911,7 @@ def ask_summary_or_full(preferences: Optional[Dict] = None):
         default_answer="summary",
         preferences=preferences,
         attempts=3,
-        max_seconds=8,
+        max_seconds=4,
     )
 
 
@@ -614,7 +922,7 @@ def ask_ready_for_next_page(preferences: Optional[Dict] = None):
         default_answer="next",
         preferences=preferences,
         attempts=3,
-        max_seconds=8,
+        max_seconds=4,
     )
 
 
@@ -725,6 +1033,9 @@ def get_user_preferences():
     preload.start()
 
     speak("Hello. Welcome to the Smart Reading Assistant System.")
+    speak(
+        "I will ask questions by voice. Wait until you hear a beep, then speak your answer."
+    )
     speak("Please tap your RFID card on the right side of the device.")
 
     rfid_id = read_rfid_uid().strip()

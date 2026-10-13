@@ -183,6 +183,12 @@ def _load_florence():
 
         torch_dtype = torch.float16 if _device == "cuda" else torch.float32
 
+        if _device == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
         _processor = AutoProcessor.from_pretrained(
             MODEL_NAME,
             trust_remote_code=True,
@@ -192,7 +198,13 @@ def _load_florence():
             trust_remote_code=True,
             torch_dtype=torch_dtype,
         )
-        _model = _model.to(_device)
+        try:
+            _model = _model.to(_device)
+        except Exception as move_error:
+            print(f"[Florence] GPU load failed ({move_error}); using CPU.")
+            logger.warning("Florence GPU load failed: %s", move_error)
+            _device = "cpu"
+            _model = _model.to("cpu")
         _ensure_forced_bos_token_id(_model)
         _model.eval()
 

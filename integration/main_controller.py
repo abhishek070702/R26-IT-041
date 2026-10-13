@@ -382,7 +382,7 @@ def ask_continue_or_stop(preferences: Dict, question: str) -> str:
         default_answer="stop",
         preferences=preferences,
         attempts=3,
-        max_seconds=8,
+        max_seconds=4,
     )
 
 
@@ -396,7 +396,7 @@ def ask_new_material_or_end(preferences: Dict) -> str:
         default_answer="end",
         preferences=preferences,
         attempts=3,
-        max_seconds=8,
+        max_seconds=4,
     )
 
 

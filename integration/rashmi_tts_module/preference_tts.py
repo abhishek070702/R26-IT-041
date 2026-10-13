@@ -264,7 +264,17 @@ def _openai_client():
 
     _OPENAI_LOAD_ATTEMPTED = True
     _load_env()
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    try:
+        from dotenv import dotenv_values
+        api_key = (
+            dotenv_values(PROJECT_ROOT / "backend" / ".env")
+            .get("OPENAI_API_KEY") or ""
+        ).strip()
+    except Exception:
+        api_key = ""
+
+    if not api_key:
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         print("OpenAI TTS key not found; reading will use Edge TTS.")
         _OPENAI_UNAVAILABLE = True

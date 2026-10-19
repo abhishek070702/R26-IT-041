@@ -199,6 +199,17 @@ def _openai_client():
 
     _OPENAI_LOAD_ATTEMPTED = True
     _load_env()
+    try:
+        from preference_tts import quiet_openai_http_logs
+
+        quiet_openai_http_logs()
+    except Exception:
+        try:
+            from .preference_tts import quiet_openai_http_logs
+
+            quiet_openai_http_logs()
+        except Exception:
+            pass
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         print("Rashmi simplifier OpenAI key not found; using local fallback.")

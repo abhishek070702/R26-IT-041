@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9,6 +10,19 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
+
+# Hide OpenAI/httpx HTTP Request lines on the Pi terminal.
+for _log_name in (
+    "openai",
+    "openai._base_client",
+    "httpx",
+    "httpcore",
+    "httpcore.connection",
+    "httpcore.http11",
+    "urllib3",
+    "urllib3.connectionpool",
+):
+    logging.getLogger(_log_name).setLevel(logging.WARNING)
 
 _THREAD_HTTP = threading.local()
 _HTTP_TIMEOUT = (5, 180)
@@ -123,9 +137,11 @@ DOCUMENT_TYPE_ALIASES = {
 sys.path.insert(0, str(CURRENT_DIR))
 
 from rashmi_tts_module.rashmi_bridge import (
+    ask_article_choice_by_voice,
     ask_by_voice,
     ask_category_by_voice,
     ask_summary_or_full,
+    ask_yes_no,
     get_user_preferences,
     save_current_preferences,
     speak,
@@ -469,17 +485,29 @@ def ask_new_material_or_end(preferences: Dict) -> str:
     )
 
 
+def list_capture_articles(
+    analysis_result: Dict,
+    document_type: str,
+) -> List[str]:
+    """
+    Real detected Harshaka categories from one capture.
+    These are the selectable 'articles' for voice choice. Never invent names.
+    """
+    categories: List[str] = get_available_categories(analysis_result)
+    if str(document_type or "").strip().lower() == "newspaper":
+        categories = [
+            item for item in categories if str(item).strip().lower() != "story"
+        ]
+    return categories
+
+
 def select_harshaka_category(
     analysis_result: Dict,
     document_type: str,
     preferences: Dict,
     announce_empty: bool = True,
 ) -> Optional[str]:
-    categories: List[str] = get_available_categories(analysis_result)
-    if str(document_type or "").strip().lower() == "newspaper":
-        categories = [
-            item for item in categories if str(item).strip().lower() != "story"
-        ]
+    categories = list_capture_articles(analysis_result, document_type)
 
     if not categories:
         if announce_empty:
@@ -488,10 +516,14 @@ def select_harshaka_category(
 
     if len(categories) == 1:
         selected_category = categories[0]
-        speak(f"Single category detected: {selected_category}.", preferences)
+        speak(f"Single article detected: {selected_category}.", preferences)
         return selected_category
 
-    selected_category = ask_category_by_voice(categories, preferences)
+    selected_category = ask_article_choice_by_voice(
+        categories,
+        preferences,
+        remaining=False,
+    )
     selected_normalized = str(selected_category or "").strip().lower()
     valid_map = {item.lower(): item for item in categories}
 
@@ -503,6 +535,82 @@ def select_harshaka_category(
     return valid_map[selected_normalized]
 
 
+def _generate_and_speak_article(
+    analysis_result: Dict,
+    selected_category: str,
+    preferences: Dict,
+    ask_depth: bool,
+    default_depth: str,
+    image_path: Path,
+    describe_context: Optional[str],
+    prefetch_describe: bool,
+    flow_started: float,
+) -> tuple[bool, bool]:
+    """
+    Generate one selected article and speak it.
+    Returns (spoke_text, described).
+    """
+    if ask_depth:
+        depth = ask_summary_or_full(preferences)
+    else:
+        depth = default_depth
+
+    if depth not in {"summary", "full"}:
+        depth = default_depth if default_depth in {"summary", "full"} else "summary"
+
+    generate_started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        generate_future = pool.submit(
+            generate_selected_harshaka_output,
+            analysis_result,
+            selected_category,
+            depth,
+        )
+        speak(
+            f"Preparing {depth} for {selected_category}.",
+            preferences,
+        )
+        final_result = generate_future.result()
+    print(
+        "[controller] timing harshaka_generate="
+        f"{time.perf_counter() - generate_started:.2f}s"
+    )
+
+    print("Harshaka final result:")
+    print(json.dumps(final_result, indent=4))
+
+    describe_future = None
+    describe_pool = None
+    if prefetch_describe and describe_context:
+        describe_pool = ThreadPoolExecutor(max_workers=1)
+        describe_future = describe_pool.submit(
+            fetch_page_visual_description,
+            image_path,
+            describe_context,
+        )
+
+    spoke_text = False
+    described = False
+    try:
+        print(
+            "[controller] timing page_to_reading_speech_start="
+            f"{time.perf_counter() - flow_started:.2f}s"
+        )
+        speak_harshaka_result(final_result, preferences)
+        spoke_text = True
+
+        if describe_future is not None:
+            described = speak_page_visual_result(
+                describe_future.result(),
+                preferences,
+            )
+    finally:
+        if describe_pool is not None:
+            describe_pool.shutdown(wait=False)
+
+    return spoke_text, described
+
+
 def run_harshaka_reading_for_image(
     image_path: Path,
     document_type: str,
@@ -510,14 +618,18 @@ def run_harshaka_reading_for_image(
     ask_depth: bool = True,
     default_depth: str = "summary",
     describe_context: Optional[str] = None,
-):
+) -> str:
     """
     Send image + document type to Harshaka.
-    Select a real detected category only. Never invent categories.
-    Speak Harshaka text when available, then describe a picture on the page
-    if one exists. Picture-only pages still get a description.
+    Select real detected articles/categories only. Never invent names.
 
-    Describe-image can prefetch while reading speech plays (speech order preserved).
+    When multiple articles are found in one capture:
+      1) ask which to read first
+      2) after reading, ask about remaining articles before any new capture
+      3) continue until the user declines or none remain
+
+    Returns:
+      "read" | "no_content" | "failed"
     """
     spoke_text = False
     described = False
@@ -537,88 +649,97 @@ def run_harshaka_reading_for_image(
             f"{time.perf_counter() - harshaka_analyze_started:.2f}s"
         )
 
+        articles = list_capture_articles(analysis_result, document_type)
         print("Harshaka analysis result preview:")
         print(json.dumps({
             "status": analysis_result.get("status"),
             "document_type": analysis_result.get("document_type"),
-            "categories": get_available_categories(analysis_result),
+            "categories": articles,
             "extracted_text_preview": (analysis_result.get("extracted_text") or "")[:500],
         }, indent=4))
 
         status_failed = str(analysis_result.get("status", "")).lower() == "failed"
-        selected_category = None
-        if not status_failed:
-            selected_category = select_harshaka_category(
-                analysis_result=analysis_result,
-                document_type=document_type,
-                preferences=preferences,
-                announce_empty=not bool(describe_context),
-            )
-
-        if selected_category:
-            if ask_depth:
-                depth = ask_summary_or_full(preferences)
-            else:
-                depth = default_depth
-
-            if depth not in {"summary", "full"}:
-                depth = default_depth if default_depth in {"summary", "full"} else "summary"
-
-            generate_started = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                generate_future = pool.submit(
-                    generate_selected_harshaka_output,
-                    analysis_result,
-                    selected_category,
-                    depth,
-                )
-                speak(
-                    f"Preparing {depth} for {selected_category}.",
-                    preferences,
-                )
-                final_result = generate_future.result()
-            print(
-                "[controller] timing harshaka_generate="
-                f"{time.perf_counter() - generate_started:.2f}s"
-            )
-
-            print("Harshaka final result:")
-            print(json.dumps(final_result, indent=4))
-
-            describe_future = None
-            if describe_context:
-                describe_pool = ThreadPoolExecutor(max_workers=1)
-                describe_future = describe_pool.submit(
-                    fetch_page_visual_description,
-                    image_path,
-                    describe_context,
-                )
-            else:
-                describe_pool = None
-
-            try:
-                print(
-                    "[controller] timing page_to_reading_speech_start="
-                    f"{time.perf_counter() - flow_started:.2f}s"
-                )
-                speak_harshaka_result(final_result, preferences)
-                spoke_text = True
-
-                if describe_future is not None:
-                    described = speak_page_visual_result(
-                        describe_future.result(),
-                        preferences,
-                    )
-            finally:
-                if describe_pool is not None:
-                    describe_pool.shutdown(wait=False)
-        else:
+        if status_failed or not articles:
             if describe_context:
                 described = describe_page_visual(
                     image_path=image_path,
                     context=describe_context,
                     preferences=preferences,
                 )
+            if not described:
+                if not bool(describe_context):
+                    speak("No readable content was found for this page.", preferences)
+                elif not articles and not status_failed:
+                    speak("No readable content was found for this page.", preferences)
+            print(
+                "[controller] timing harshaka_page_total="
+                f"{time.perf_counter() - flow_started:.2f}s"
+            )
+            return "no_content"
+
+        remaining = list(articles)
+        first_choice = True
+        while remaining:
+            if len(remaining) == 1 and first_choice:
+                selected_category = remaining[0]
+                speak(
+                    f"Single article detected: {selected_category}.",
+                    preferences,
+                )
+            else:
+                selected_raw = ask_article_choice_by_voice(
+                    remaining,
+                    preferences,
+                    remaining=not first_choice,
+                )
+                selected_normalized = str(selected_raw or "").strip().lower()
+                valid_map = {item.lower(): item for item in remaining}
+                selected_category = valid_map.get(selected_normalized)
+                if not selected_category:
+                    speak(
+                        "I could not match that article. Please try again.",
+                        preferences,
+                    )
+                    continue
+
+            article_spoke, article_described = _generate_and_speak_article(
+                analysis_result=analysis_result,
+                selected_category=selected_category,
+                preferences=preferences,
+                ask_depth=ask_depth,
+                default_depth=default_depth,
+                image_path=image_path,
+                describe_context=describe_context,
+                prefetch_describe=first_choice and bool(describe_context),
+                flow_started=flow_started,
+            )
+            spoke_text = spoke_text or article_spoke
+            described = described or article_described
+
+            remaining = [
+                item
+                for item in remaining
+                if item.lower() != selected_category.lower()
+            ]
+            first_choice = False
+
+            if not remaining:
+                break
+
+            if len(remaining) == 1:
+                more_question = (
+                    f"Do you want to read the remaining article, "
+                    f"{remaining[0]}? Say yes or no."
+                )
+            else:
+                more_question = (
+                    "Do you want to read either of the remaining articles? "
+                    "Say yes or no."
+                )
+
+            more = ask_yes_no(more_question, preferences, default_answer="no")
+            if more != "yes":
+                break
 
         if not spoke_text and not described:
             speak("No readable content was found for this page.", preferences)
@@ -627,6 +748,7 @@ def run_harshaka_reading_for_image(
             "[controller] timing harshaka_page_total="
             f"{time.perf_counter() - flow_started:.2f}s"
         )
+        return "read" if spoke_text or described else "no_content"
 
     except Exception as error:
         print("Harshaka reading failed:")
@@ -640,6 +762,7 @@ def run_harshaka_reading_for_image(
             )
         if not described:
             speak("Content reading module failed for this page.", preferences)
+        return "failed"
 
 
 def run_page_loop(
@@ -720,15 +843,16 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
         preferences,
     )
 
+    confirm_before_capture = True
     while True:
-        choice = ask_continue_or_stop(
-            preferences,
-            "Say next to capture one article, or say stop.",
-        )
-
-        if choice == "stop":
-            speak("Newspaper reading stopped.", preferences)
-            break
+        if confirm_before_capture:
+            choice = ask_continue_or_stop(
+                preferences,
+                "Say next to capture articles from the page, or say stop.",
+            )
+            if choice == "stop":
+                speak("Newspaper reading stopped.", preferences)
+                break
 
         ok = run_camera_once(preferences, target_module="capture_only")
         if not ok:
@@ -737,8 +861,10 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
         image_path = get_latest_captured_image_path()
         if image_path is None:
             speak("Captured newspaper article image was not found.", preferences)
+            confirm_before_capture = True
             continue
 
+        # Read all chosen articles from THIS capture before any new capture.
         run_harshaka_reading_for_image(
             image_path=image_path,
             document_type="Newspaper",
@@ -747,6 +873,24 @@ def run_newspaper_loop(first_image_path: Optional[Path], preferences: Dict):
             default_depth="summary",
             describe_context="newspaper_article_image",
         )
+
+        other = ask_yes_no(
+            "Would you like to read any other material? Say yes or no.",
+            preferences,
+            default_answer="no",
+        )
+        if other != "yes":
+            speak("Newspaper reading stopped.", preferences)
+            break
+
+        speak(
+            "Please place the next reading material in front of the camera.",
+            preferences,
+        )
+        # User already said yes to more material — open camera again without
+        # asking for another next/stop, and without discarding unread articles
+        # from a prior capture (those were already offered above).
+        confirm_before_capture = False
 
 
 def run_report_flow(image_path: Optional[Path], preferences: Dict):

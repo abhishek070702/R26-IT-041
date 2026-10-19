@@ -208,6 +208,15 @@ class VoiceSystem:
         with self._lock:
             return self._speaking or self._pending > 0 or not self.voice_queue.empty()
 
+    def wait_until_idle(self, timeout: float = 20.0) -> bool:
+        """Block until queued speech finishes so capture cues are not cut off."""
+        deadline = time.perf_counter() + max(0.0, float(timeout))
+        while self.is_busy():
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
     def say(self, text, force=False):
         text = str(text or "").strip()
         if not text:
@@ -973,14 +982,18 @@ def main():
                 f"[camera] timing save_capture={time.perf_counter() - capture_t0:.2f}s"
             )
 
+            # Announce immediately after save so the user hears success before
+            # any long Abhishek/Harshaka handoff. Wait so process exit cannot
+            # cut off the cue.
+            voice.say("Page captured successfully.", force=True)
+            voice.wait_until_idle(timeout=20.0)
+
             handoff_t0 = time.perf_counter()
             send_to_next_module(captured_image_path)
             print(
                 f"[camera] timing next_module_handoff="
                 f"{time.perf_counter() - handoff_t0:.2f}s"
             )
-
-            voice.say("Page captured successfully.", force=True)
 
             last_capture_time = current_time
             session_has_captured = True
@@ -990,6 +1003,7 @@ def main():
 
             if single_capture:
                 print("Single capture done. Closing camera.")
+                voice.wait_until_idle(timeout=5.0)
                 break
 
         if show_preview:
@@ -1035,6 +1049,7 @@ def main():
                 print("Cannot calibrate. No page detected.")
                 voice.say("No page detected")
 
+    voice.wait_until_idle(timeout=10.0)
     cap.release()
     if show_preview:
         cv2.destroyAllWindows()

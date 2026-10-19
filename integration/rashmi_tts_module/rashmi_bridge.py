@@ -948,6 +948,61 @@ def ask_category_by_voice(categories: List[str], preferences: Optional[Dict] = N
     )
 
 
+def ask_article_choice_by_voice(
+    articles: List[str],
+    preferences: Optional[Dict] = None,
+    *,
+    remaining: bool = False,
+):
+    """
+    Ask which detected article/category to read.
+    Uses Harshaka category names as the selectable article labels.
+    """
+    clean = [str(item).strip() for item in articles if str(item).strip()]
+    if not clean:
+        return ""
+
+    if len(clean) == 1:
+        return clean[0]
+
+    listed = ", ".join(clean)
+    if remaining:
+        question = (
+            f"I found these remaining articles: {listed}. "
+            "Which article would you like to read next?"
+        )
+    else:
+        question = (
+            f"I found these articles: {listed}. "
+            "Which article would you like to read first?"
+        )
+
+    return ask_by_voice(
+        question=question,
+        valid_answers=clean,
+        default_answer=clean[0],
+        preferences=preferences,
+        attempts=3,
+        max_seconds=5,
+    )
+
+
+def ask_yes_no(
+    question: str,
+    preferences: Optional[Dict] = None,
+    default_answer: str = "no",
+) -> str:
+    """Ask a yes/no question by voice. Returns 'yes' or 'no'."""
+    return ask_by_voice(
+        question=question,
+        valid_answers=["yes", "no"],
+        default_answer=default_answer if default_answer in {"yes", "no"} else "no",
+        preferences=preferences,
+        attempts=3,
+        max_seconds=4,
+    )
+
+
 def ask_summary_or_full(preferences: Optional[Dict] = None):
     return ask_by_voice(
         question="Do you want a summary or full text?",
@@ -1005,7 +1060,23 @@ def ask_tone_preference(preferences: Optional[Dict] = None) -> str:
     return selected_tone
 
 
-def ask_new_preferences(rfid_id: str, is_new_user: bool = True):
+def ask_reading_level(preferences: Optional[Dict] = None) -> str:
+    """Ask reading level so text simplification can be applied while reading."""
+    return ask_by_voice(
+        "Text simplification is enabled. "
+        "Please say your reading level. Say very simple, moderate, or light.",
+        ["very simple", "moderate", "light"],
+        "very simple",
+        preferences,
+        max_seconds=10,
+    )
+
+
+def ask_new_preferences(
+    rfid_id: str,
+    is_new_user: bool = True,
+    ask_reading_level_choice: bool = True,
+):
     if is_new_user:
         speak("New user detected. I will ask your preferences now.")
     else:
@@ -1013,13 +1084,12 @@ def ask_new_preferences(rfid_id: str, is_new_user: bool = True):
 
     temp_preferences = {"pace": "normal"}
 
-    reading_level = ask_by_voice(
-        "Please say your reading level. Say very simple, moderate, or light.",
-        ["very simple", "moderate", "light"],
-        "very simple",
-        temp_preferences,
-        max_seconds=10,
-    )
+    if ask_reading_level_choice:
+        reading_level = ask_reading_level(temp_preferences)
+    else:
+        # Skip reading-level selection: keep original text (no simplification).
+        reading_level = "light"
+        print("Reading level selection skipped; simplification disabled (light).")
 
     voice = ask_by_voice(
         "Please say your voice type. Say male or female.",
@@ -1138,7 +1208,7 @@ def get_user_preferences():
     )
 
     answer = ask_by_voice(
-        "Do you want to use your previous preferences? Say yes or no.",
+        "Would you like to use your previous preferences? Please say yes or no.",
         ["yes", "no"],
         "yes",
         preferences,
@@ -1150,11 +1220,27 @@ def get_user_preferences():
     )
 
     if answer == "yes":
-        save_current_preferences(preferences)
+        # Keep saved voice/pace/tone, enable simplification, and ask reading level.
         speak("Previous preferences loaded.", preferences)
+        reading_level = ask_reading_level(preferences)
+        preferences["reading_level"] = reading_level
+        save_user_preferences(
+            rfid_id=rfid_id,
+            reading_level=reading_level,
+            voice=str(preferences.get("voice") or "female"),
+            pace=str(preferences.get("pace") or "normal"),
+            tone=str(preferences.get("tone") or "natural"),
+        )
+        save_current_preferences(preferences)
+        speak(f"Reading level set to {reading_level}.", preferences)
         return preferences
 
-    return ask_new_preferences(rfid_id, is_new_user=False)
+    # No: skip reading-level selection; continue with voice, pace, and tone.
+    return ask_new_preferences(
+        rfid_id,
+        is_new_user=False,
+        ask_reading_level_choice=False,
+    )
 
 
 def format_abhishek_result_for_speech(result: Dict):

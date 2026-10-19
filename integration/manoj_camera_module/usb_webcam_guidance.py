@@ -929,9 +929,10 @@ def main():
                 detection
             )
 
-            send_to_next_module(captured_image_path)
+            # Speak success before long next-module handoff (force is synchronous here).
+            voice.say("Page captured successfully.", force=True)
 
-            voice.say("Page captured successfully", force=True)
+            send_to_next_module(captured_image_path)
 
             last_capture_time = current_time
             session_has_captured = True

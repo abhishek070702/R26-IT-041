@@ -9,6 +9,7 @@ espeak-ng / Windows Speech is only the last offline fallback.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import platform
 import re
@@ -20,6 +21,27 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+
+
+def quiet_openai_http_logs() -> None:
+    """
+    Hide OpenAI/httpx 'HTTP Request: POST https://api.openai.com/...' lines
+    in the Raspberry Pi terminal. Does not change TTS or API behavior.
+    """
+    for name in (
+        "openai",
+        "openai._base_client",
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "urllib3",
+        "urllib3.connectionpool",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+quiet_openai_http_logs()
 
 # Welcome-message voice. Used for guidance, camera cues, and other system talk.
 # User reading prefs (voice/pace/tone/level) must not change this.
@@ -282,6 +304,7 @@ def _openai_client():
     # Prefer os.getenv (same as optimization/instant-reading-after-capture).
     # Do not force backend/.env over an exported shell key.
     _load_env()
+    quiet_openai_http_logs()
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         print("OpenAI TTS key not found; reading will use Edge TTS.")
@@ -292,6 +315,7 @@ def _openai_client():
         from openai import OpenAI
 
         _OPENAI_CLIENT = OpenAI(api_key=api_key, timeout=20.0)
+        quiet_openai_http_logs()
         return _OPENAI_CLIENT
     except Exception as error:
         print("OpenAI TTS client failed:", error)
